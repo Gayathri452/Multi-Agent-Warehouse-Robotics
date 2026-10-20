@@ -11,13 +11,15 @@ ROBOTS = [
 ]
 
 
-def static_tf(x, y, z, yaw, parent, child):
+def static_tf(name, x, y, z, yaw, parent, child):
+    # Each robot has its own TF topics: /<name>/tf and /<name>/tf_static
     return Node(
         package='tf2_ros', executable='static_transform_publisher',
         name='static_tf_' + child.replace('/', '_'),
         arguments=['--x', str(x), '--y', str(y), '--z', str(z),
                    '--yaw', str(yaw), '--pitch', '0', '--roll', '0',
                    '--frame-id', parent, '--child-frame-id', child],
+        remappings=[('/tf_static', f'/{name}/tf_static')],
     )
 
 
@@ -37,7 +39,6 @@ def generate_launch_description():
 
     actions = [gz_sim]
     bridge_args = ['/clock@rosgraph_msgs/msg/Clock[gz.msgs.Clock']
-    remaps = []
 
     for name, x, y, yaw in ROBOTS:
         sdf = template_text.replace('__NAME__', name)
@@ -54,14 +55,14 @@ def generate_launch_description():
             f'/{name}/scan@sensor_msgs/msg/LaserScan[gz.msgs.LaserScan',
             f'/{name}/imu@sensor_msgs/msg/Imu[gz.msgs.IMU',
         ]
-        remaps.append((f'/{name}/tf', '/tf'))
         actions += [
-            static_tf(x, y, 0.0, yaw, 'map', f'{name}/odom'),
-            static_tf(0.2, 0.0, 0.12, 0.0, f'{name}/base_link', f'{name}/lidar_link'),
-            static_tf(0.0, 0.0, 0.0, 0.0, f'{name}/base_link', f'{name}/imu_link'),
+            static_tf(name, x, y, 0.0, yaw, 'map', f'{name}/odom'),
+            static_tf(name, 0.2, 0.0, 0.12, 0.0,
+                      f'{name}/base_link', f'{name}/lidar_link'),
+            static_tf(name, 0.0, 0.0, 0.0, 0.0,
+                      f'{name}/base_link', f'{name}/imu_link'),
         ]
 
     actions.append(Node(package='ros_gz_bridge', executable='parameter_bridge',
-                        arguments=bridge_args, remappings=remaps,
-                        output='screen'))
+                        arguments=bridge_args, output='screen'))
     return LaunchDescription(actions)
