@@ -56,7 +56,7 @@ def generate_launch_description():
             f'/{name}/imu@sensor_msgs/msg/Imu[gz.msgs.IMU',
         ]
         actions += [
-            static_tf(name, x, y, 0.0, yaw, 'map', f'{name}/odom'),
+            # static_tf(name, x, y, 0.0, yaw, 'map', f'{name}/odom'),
             static_tf(name, 0.2, 0.0, 0.12, 0.0,
                       f'{name}/base_link', f'{name}/lidar_link'),
             static_tf(name, 0.0, 0.0, 0.0, 0.0,

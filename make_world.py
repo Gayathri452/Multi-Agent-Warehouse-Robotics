@@ -3,8 +3,8 @@ import os
 HEAD = """<?xml version="1.0"?>
 <sdf version="1.9">
   <world name="warehouse">
-    <physics name="1ms" type="ignored">
-      <max_step_size>0.001</max_step_size>
+    <physics name="4ms" type="ignored">
+      <max_step_size>0.004</max_step_size>
       <real_time_factor>1.0</real_time_factor>
     </physics>
     <plugin filename="gz-sim-physics-system" name="gz::sim::systems::Physics"/>
