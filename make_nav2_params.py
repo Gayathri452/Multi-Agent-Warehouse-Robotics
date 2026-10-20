@@ -11,8 +11,8 @@ FRAMES = {
     'base_footprint': ROBOT + '/base_link',
     'odom': ROBOT + '/odom',
 }
-TOPICS = {'/scan': 'scan', '/odom': 'odom'}
-TOPIC_KEYS = ('topic', 'scan_topic', 'odom_topic')
+TOPICS = {'/scan': 'scan', '/odom': 'odom', '/local_costmap/published_footprint': 'local_costmap/published_footprint'}
+TOPIC_KEYS = ('topic', 'scan_topic', 'odom_topic', 'footprint_topic')
 changes = []
 
 
