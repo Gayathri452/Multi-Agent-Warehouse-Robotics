@@ -26,6 +26,7 @@ setup(
     entry_points={
         'console_scripts': [
             'drive_test = ugp_warehouse.drive_test:main',
+            'astar_nav = ugp_warehouse.astar_nav:main',
         ],
     },
 )
