@@ -27,9 +27,16 @@ Parameters
   settle_seconds (1.0)   pause after stopping the robots, before replanning
   stall_seconds  (20.0)  replan if someone waits and no robot got further for this long
 
+Nav2 quirk handled here: navigate_through_poses drops a pose once the robot is
+within 0.7 m of it (RemovePassedGoals). If that was the LAST pose, Nav2 aborts with
+"Resulting plan has 0 poses". So one-pose segments use navigate_to_pose, and a
+through-poses segment aborted within FINISH_RADIUS of its end is finished with
+navigate_to_pose instead of failing the task.
+
 ROS interfaces
   subscribes : /<robot>/amcl_pose   geometry_msgs/PoseWithCovarianceStamped
-  action     : /<robot>/navigate_through_poses  nav2_msgs/NavigateThroughPoses
+  actions    : /<robot>/navigate_through_poses  nav2_msgs/NavigateThroughPoses
+               /<robot>/navigate_to_pose        nav2_msgs/NavigateToPose
   publishes  : /task_status   std_msgs/String (JSON, 1 Hz): every task and robot state
                /<robot>/planned_path  nav_msgs/Path (latched): the robot's current plan
 """
@@ -41,7 +48,7 @@ import time
 import rclpy
 from ament_index_python.packages import get_package_share_directory
 from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
-from nav2_msgs.action import NavigateThroughPoses
+from nav2_msgs.action import NavigateThroughPoses, NavigateToPose
 from nav_msgs.msg import Path
 from rclpy.action import ActionClient
 from rclpy.node import Node
@@ -56,18 +63,25 @@ from ugp_warehouse.tasks import (DONE, FAILED, PENDING, TO_DELIVERY, TO_PICKUP,
                                  Task, assign)
 
 SUCCEEDED = 4                                     # action_msgs GoalStatus.STATUS_SUCCEEDED
+FINISH_RADIUS = 1.0      # m: an abort this close to the segment end is Nav2's dropped last pose
 
 
 class Robot:
-    def __init__(self, name, xy, client):
+    def __init__(self, name, xy, through_client, to_client):
         self.name = name
         self.xy = xy                              # updated from AMCL
-        self.client = client
+        self.client = through_client              # navigate_through_poses
+        self.to_client = to_client                # navigate_to_pose
         self.task = None                          # the Task it is working on, or None (idle)
         self.completed = 0
         self.gen = 0                              # bumped on every stop; older callbacks ignored
         self.handle = None                        # Nav2 goal handle of the segment in flight
         self.driving = False
+        self.segment = None                       # waypoints of the segment in flight
+        self.finishing = False                    # True while finishing it with navigate_to_pose
+
+    def ready(self):
+        return self.client.server_is_ready() and self.to_client.server_is_ready()
 
 
 class TaskManager(Node):
@@ -97,9 +111,10 @@ class TaskManager(Node):
         self.robots = {}
         self.path_pubs = {}
         for name, x, y, _ in ROBOTS:
-            client = ActionClient(self, NavigateThroughPoses,
-                                  '/%s/navigate_through_poses' % name)
-            self.robots[name] = Robot(name, (x, y), client)
+            through = ActionClient(self, NavigateThroughPoses,
+                                   '/%s/navigate_through_poses' % name)
+            to_pose = ActionClient(self, NavigateToPose, '/%s/navigate_to_pose' % name)
+            self.robots[name] = Robot(name, (x, y), through, to_pose)
             self.fleet.on_pose(name, (x, y))
             self.create_subscription(
                 PoseWithCovarianceStamped, '/%s/amcl_pose' % name,
@@ -130,7 +145,7 @@ class TaskManager(Node):
     def tick(self):
         idle = {n: {'xy': r.xy, 'completed': r.completed}
                 for n, r in self.robots.items()
-                if r.task is None and r.client.server_is_ready()}
+                if r.task is None and r.ready()}
         pending = [t for t in self.tasks if t.state == PENDING]
         if idle and pending:
             assigned, infeasible = assign(self.grid, pending, idle, LOCATIONS)
@@ -177,7 +192,7 @@ class TaskManager(Node):
             self.replan(now)
         someone_waits = False
         for name, robot in self.robots.items():
-            if robot.driving or not robot.client.server_is_ready():
+            if robot.driving or not robot.ready():
                 continue
             what, data = self.fleet.next_segment(name)
             if what == 'drive':
@@ -238,11 +253,24 @@ class TaskManager(Node):
     # ---- one segment = waypoints -> Nav2 -------------------------------------
     def send_segment(self, name, waypoints):
         robot = self.robots[name]
+        robot.segment = waypoints
+        robot.finishing = False
+        if len(waypoints) == 1:                   # one pose: navigate_to_pose has no quirk
+            return self.send_to_pose(name, waypoints[0])
         goal = NavigateThroughPoses.Goal()
         goal.poses = [self.make_pose(*w) for w in waypoints]
+        self.send_goal(name, robot.client, goal)
+
+    def send_to_pose(self, name, waypoint):
+        goal = NavigateToPose.Goal()
+        goal.pose = self.make_pose(*waypoint)
+        self.send_goal(name, self.robots[name].to_client, goal)
+
+    def send_goal(self, name, client, goal):
+        robot = self.robots[name]
         robot.driving = True
         gen = robot.gen
-        future = robot.client.send_goal_async(goal)
+        future = client.send_goal_async(goal)
         future.add_done_callback(lambda f, n=name, g=gen: self.on_goal_response(n, g, f))
 
     def on_goal_response(self, name, gen, future):
@@ -268,8 +296,17 @@ class TaskManager(Node):
         status = future.result().status
         if status == SUCCEEDED:
             self.fleet.on_segment_done(name)
-        else:
-            self.fail(name, 'Nav2 ended with status %d' % status)
+            return
+        end = robot.segment[-1] if robot.segment else None
+        if end and not robot.finishing and \
+                math.hypot(robot.xy[0] - end[0], robot.xy[1] - end[1]) <= FINISH_RADIUS:
+            robot.finishing = True                # Nav2 dropped the last pose just short of it
+            self.get_logger().info('%s: Nav2 stopped %.2f m short of the segment end, '
+                                   'finishing with navigate_to_pose'
+                                   % (name, math.hypot(robot.xy[0] - end[0],
+                                                       robot.xy[1] - end[1])))
+            return self.send_to_pose(name, end)
+        self.fail(name, 'Nav2 ended with status %d' % status)
 
     def leg_done(self, name):
         robot = self.robots[name]
