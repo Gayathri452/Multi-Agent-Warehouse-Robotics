@@ -1,34 +1,48 @@
-import os
-from ament_index_python.packages import get_package_share_directory
+"""AMCL localization for ONE robot (publishes map -> <robot>/odom).
+
+  ros2 launch ugp_warehouse amcl.launch.py robot:=robot_2 x:=-8.3 y:=-1.0 yaw:=-1.5708
+
+Defaults match robot_1. x, y, yaw are the robot's spawn pose = AMCL's initial pose.
+"""
 from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument, OpaqueFunction
+from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
-# Spawn pose of robot_1 (must match warehouse.launch.py)
-NAME, X, Y, YAW = 'robot_1', -8.0, 0.0, 0.0
 
-def generate_launch_description():
-    pkg = get_package_share_directory('ugp_warehouse')
-    params = os.path.join(pkg, 'config', 'nav2_params.yaml')
+def launch_setup(context):
+    robot = LaunchConfiguration('robot').perform(context)
+    x = float(LaunchConfiguration('x').perform(context))
+    y = float(LaunchConfiguration('y').perform(context))
+    yaw = float(LaunchConfiguration('yaw').perform(context))
     amcl = Node(
         package='nav2_amcl', executable='amcl', name='amcl',
-        namespace=NAME, output='screen',
-        parameters=[params, {
+        namespace=robot, output='screen',
+        parameters=[{
             'use_sim_time': True,
             'set_initial_pose': True,
-            'odom_frame_id': NAME + '/odom',
-            'base_frame_id': NAME + '/base_link',
+            'initial_pose.x': x, 'initial_pose.y': y,
+            'initial_pose.z': 0.0, 'initial_pose.yaw': yaw,
+            'odom_frame_id': robot + '/odom',
+            'base_frame_id': robot + '/base_link',
             'global_frame_id': 'map',
-            'initial_pose.x': X, 'initial_pose.y': Y,
-            'initial_pose.z': 0.0, 'initial_pose.yaw': YAW,
         }],
-        remappings=[('/tf', 'tf'), ('/tf_static', 'tf_static'),
-                    ('map', '/map')],
+        # per-robot TF topics; all robots share the one map server at /map
+        remappings=[('/tf', 'tf'), ('/tf_static', 'tf_static'), ('map', '/map')],
     )
     manager = Node(
         package='nav2_lifecycle_manager', executable='lifecycle_manager',
-        name='lifecycle_manager_localization', namespace=NAME,
-        output='screen',
-        parameters=[{'use_sim_time': True, 'autostart': True,
-                     'node_names': ['amcl']}],
+        name='lifecycle_manager_localization', namespace=robot, output='screen',
+        parameters=[{'use_sim_time': True, 'autostart': True, 'node_names': ['amcl']}],
     )
-    return LaunchDescription([amcl, manager])
+    return [amcl, manager]
+
+
+def generate_launch_description():
+    return LaunchDescription([
+        DeclareLaunchArgument('robot', default_value='robot_1'),
+        DeclareLaunchArgument('x', default_value='-8.0'),
+        DeclareLaunchArgument('y', default_value='0.0'),
+        DeclareLaunchArgument('yaw', default_value='0.0'),
+        OpaqueFunction(function=launch_setup),
+    ])

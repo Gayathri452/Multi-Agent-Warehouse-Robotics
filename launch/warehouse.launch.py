@@ -6,9 +6,7 @@ from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch_ros.actions import Node
 
 # (name, x, y, yaw) -- add more robots here in Phase 4
-ROBOTS = [
-    ('robot_1', -8.0, 0.0, 0.0),
-]
+from ugp_warehouse.robots import ROBOTS
 
 
 def static_tf(name, x, y, z, yaw, parent, child):
