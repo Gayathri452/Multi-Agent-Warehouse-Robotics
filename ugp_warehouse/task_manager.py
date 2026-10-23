@@ -1,38 +1,66 @@
 """task_manager: creates pickup/delivery tasks, assigns them to robots, tracks them.
 
 Roles in the project pipeline (kept separate on purpose):
-  * Task manager (this node) : owns the task list and each task's state.
+  * Task manager (this node) : owns the task list and each task's state; talks to ROS.
   * Assignment (tasks.py)    : decides WHO does a task (A* cost + load balancing).
-  * A* (astar_nav.plan_waypoints): decides HOW the robot gets there (waypoints).
+  * Fleet (fleet.py)         : plans every robot's current leg together (CBS, cbs.py)
+                               and decides when each robot may drive on.
   * Nav2                     : drives the robot along those waypoints.
 
 A task has two legs: robot -> pickup, then pickup -> delivery.
 States: PENDING -> TO_PICKUP -> TO_DELIVERY -> DONE   (or FAILED).
 
+Coordination (Phase 6). Whenever a leg starts or ends, all robots stop briefly
+and are planned together from where they are. Each robot then drives in segments:
+up to the last cell it may enter, then it waits until the robots it has to let
+pass have moved on. Nothing waits on a timer, so Nav2 driving faster or slower
+than planned cannot make robots meet.
+
 Run:
   ros2 run ugp_warehouse task_manager --ros-args -p use_sim_time:=true
-  ros2 run ugp_warehouse task_manager --ros-args -p use_sim_time:=true \
-      -p tasks:="['P1:D1','P2:D2']"
+  ros2 run ugp_warehouse task_manager --ros-args -p use_sim_time:=true \\
+      -p tasks:="['P2:D1','D1:P1']"          # opposing traffic: the deliberate conflict
+
+Parameters
+  goal_tolerance (0.25)  keep equal to Nav2's xy_goal_tolerance; sets the separation
+  suboptimality  (1.1)   CBS may return a plan up to 10% longer, but finds it much faster
+  settle_seconds (1.0)   pause after stopping the robots, before replanning
+  stall_seconds  (20.0)  replan if someone waits and no robot got further for this long
+
+Nav2 hiccups are retried, not failed: a goal rejected while Nav2 is still starting
+is resent every RETRY_DELAY seconds, and a drive Nav2 aborts (e.g. "Resulting plan
+has 0 poses" when the controller loses track of its path) triggers a joint replan
+from where the robots are, up to MAX_RETRIES times per leg.
+
+Nav2 quirk handled here: navigate_through_poses drops a pose once the robot is
+within 0.7 m of it (RemovePassedGoals). If that was the LAST pose, Nav2 aborts with
+"Resulting plan has 0 poses". So one-pose segments use navigate_to_pose, and a
+through-poses segment aborted within FINISH_RADIUS of its end is finished with
+navigate_to_pose instead of failing the task.
 
 ROS interfaces
   subscribes : /<robot>/amcl_pose   geometry_msgs/PoseWithCovarianceStamped
-  action     : /<robot>/navigate_through_poses  nav2_msgs/NavigateThroughPoses
+  actions    : /<robot>/navigate_through_poses  nav2_msgs/NavigateThroughPoses
+               /<robot>/navigate_to_pose        nav2_msgs/NavigateToPose
   publishes  : /task_status   std_msgs/String (JSON, 1 Hz): every task and robot state
+               /<robot>/planned_path  nav_msgs/Path (latched): the robot's current plan
 """
 import json
 import math
 import os
+import time
 
 import rclpy
 from ament_index_python.packages import get_package_share_directory
 from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
-from nav2_msgs.action import NavigateThroughPoses
+from nav2_msgs.action import NavigateThroughPoses, NavigateToPose
+from nav_msgs.msg import Path
 from rclpy.action import ActionClient
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import String
 
-from ugp_warehouse.astar_nav import plan_waypoints
+from ugp_warehouse.fleet import LEG, Fleet, default_min_sep
 from ugp_warehouse.grid_map import GridMap
 from ugp_warehouse.locations import LOCATIONS
 from ugp_warehouse.robots import ROBOTS
@@ -40,15 +68,31 @@ from ugp_warehouse.tasks import (DONE, FAILED, PENDING, TO_DELIVERY, TO_PICKUP,
                                  Task, assign)
 
 SUCCEEDED = 4                                     # action_msgs GoalStatus.STATUS_SUCCEEDED
+FINISH_RADIUS = 1.0      # m: an abort this close to the segment end is Nav2's dropped last pose
+MAX_RETRIES = 3          # Nav2 aborts tolerated per leg before the task is marked FAILED
+RETRY_DELAY = 3.0        # s to wait before resending a goal Nav2 rejected
+MAX_REJECTIONS = 40      # about two minutes of rejections: Nav2 is not coming up
 
 
 class Robot:
-    def __init__(self, name, xy, client):
+    def __init__(self, name, xy, through_client, to_client):
         self.name = name
         self.xy = xy                              # updated from AMCL
-        self.client = client
+        self.client = through_client              # navigate_through_poses
+        self.to_client = to_client                # navigate_to_pose
         self.task = None                          # the Task it is working on, or None (idle)
         self.completed = 0
+        self.gen = 0                              # bumped on every stop; older callbacks ignored
+        self.handle = None                        # Nav2 goal handle of the segment in flight
+        self.driving = False
+        self.segment = None                       # waypoints of the segment in flight
+        self.finishing = False                    # True while finishing it with navigate_to_pose
+        self.retries = 0                          # Nav2 aborts on the current leg
+        self.rejections = 0                       # goals rejected in a row (Nav2 starting up)
+        self.hold_until = 0.0                     # do not send goals before this time
+
+    def ready(self):
+        return self.client.server_is_ready() and self.to_client.server_is_ready()
 
 
 class TaskManager(Node):
@@ -57,7 +101,17 @@ class TaskManager(Node):
         self.declare_parameter('tasks', ['P1:D1', 'P2:D2', 'P1:D2', 'P2:D1'])
         self.declare_parameter('map_yaml', os.path.join(
             get_package_share_directory('ugp_warehouse'), 'config', 'warehouse_map.yaml'))
+        self.declare_parameter('goal_tolerance', 0.25)
+        self.declare_parameter('suboptimality', 1.1)
+        self.declare_parameter('settle_seconds', 1.0)
+        self.declare_parameter('stall_seconds', 20.0)
         self.grid = GridMap.from_yaml(self.get_parameter('map_yaml').value)
+        self.settle = self.get_parameter('settle_seconds').value
+        self.stall = self.get_parameter('stall_seconds').value
+        sep = default_min_sep(self.grid.cell,
+                              stop_tolerance=self.get_parameter('goal_tolerance').value)
+        self.fleet = Fleet(self.grid, [r[0] for r in ROBOTS], min_sep=sep,
+                           w=self.get_parameter('suboptimality').value)
         self.tasks = []
         for i, spec in enumerate(self.get_parameter('tasks').value, start=1):
             pickup, delivery = spec.split(':')
@@ -66,29 +120,43 @@ class TaskManager(Node):
         qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
                          durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self.robots = {}
+        self.path_pubs = {}
         for name, x, y, _ in ROBOTS:
-            client = ActionClient(self, NavigateThroughPoses,
-                                  '/%s/navigate_through_poses' % name)
-            self.robots[name] = Robot(name, (x, y), client)
+            through = ActionClient(self, NavigateThroughPoses,
+                                   '/%s/navigate_through_poses' % name)
+            to_pose = ActionClient(self, NavigateToPose, '/%s/navigate_to_pose' % name)
+            self.robots[name] = Robot(name, (x, y), through, to_pose)
+            self.fleet.on_pose(name, (x, y))
             self.create_subscription(
                 PoseWithCovarianceStamped, '/%s/amcl_pose' % name,
                 lambda msg, n=name: self.on_pose(n, msg), qos)
+            self.path_pubs[name] = self.create_publisher(Path, '/%s/planned_path' % name, qos)
         self.status_pub = self.create_publisher(String, '/task_status', 10)
+        self.replan_reason = None                 # set when a joint replan is needed
+        self.settle_until = None                  # robots stopped: plan once they settle
+        self.signature, self.last_progress = None, 0.0
+        self.waiting = {}                         # name -> robots it currently waits for
+        self.method = ''
         self.finished_logged = False
         self.create_timer(1.0, self.tick)
-        self.get_logger().info('Task manager: %d tasks, robots %s'
-                               % (len(self.tasks), list(self.robots)))
+        self.create_timer(0.2, self.control)
+        self.get_logger().info('Task manager: %d tasks, robots %s, separation %.2f m'
+                               % (len(self.tasks), list(self.robots), sep * self.grid.cell))
+
+    def now(self):
+        return self.get_clock().now().nanoseconds * 1e-9
 
     # ---- inputs -----------------------------------------------------------
     def on_pose(self, name, msg):
         p = msg.pose.pose.position
         self.robots[name].xy = (p.x, p.y)
+        self.fleet.on_pose(name, (p.x, p.y))
 
-    # ---- main loop (1 Hz): hand pending tasks to idle robots ----------------
+    # ---- task loop (1 Hz): hand pending tasks to idle robots ------------------
     def tick(self):
         idle = {n: {'xy': r.xy, 'completed': r.completed}
                 for n, r in self.robots.items()
-                if r.task is None and r.client.server_is_ready()}
+                if r.task is None and r.ready()}
         pending = [t for t in self.tasks if t.state == PENDING]
         if idle and pending:
             assigned, infeasible = assign(self.grid, pending, idle, LOCATIONS)
@@ -98,6 +166,8 @@ class TaskManager(Node):
                                         % (t.id, t.pickup, t.delivery))
             for task, name, cost in assigned:
                 self.start_task(task, name, cost)
+            if assigned:
+                self.request_replan('new task')
         self.publish_status()
         if not self.finished_logged and all(t.state in (DONE, FAILED) for t in self.tasks):
             self.finished_logged = True
@@ -111,57 +181,187 @@ class TaskManager(Node):
         task.robot = name
         task.state = TO_PICKUP
         self.robots[name].task = task
-        self.send_leg(name, LOCATIONS[task.pickup])
+        self.robots[name].retries = 0
 
-    # ---- one leg = A* waypoints -> Nav2 -------------------------------------
-    def send_leg(self, name, target_xy):
+    # ---- control loop (5 Hz): replan when needed, release robots that may drive ----
+    def request_replan(self, reason):
+        self.replan_reason = self.replan_reason or reason
+
+    def control(self):
+        now = self.now()
+        if self.replan_reason is not None:
+            reason, self.replan_reason = self.replan_reason, None
+            moving = any(r.driving for r in self.robots.values())
+            if moving:
+                self.stop_all()
+            self.settle_until = now + (self.settle if moving else 0.0)
+            self.get_logger().info('Replanning (%s)%s'
+                                   % (reason, ': stopping all robots' if moving else ''))
+        if self.settle_until is not None:
+            if now < self.settle_until:
+                return
+            self.settle_until = None
+            self.replan(now)
+        someone_waits = False
+        for name, robot in self.robots.items():
+            if robot.driving or not robot.ready() or now < robot.hold_until:
+                continue
+            what, data = self.fleet.next_segment(name)
+            if what == 'drive':
+                self.send_segment(name, data)
+            elif what == 'done' and data == LEG:
+                self.leg_done(name)
+            elif what == 'wait':
+                someone_waits = True
+                if self.waiting.get(name) != data:
+                    self.get_logger().info('%s waits for %s to pass' % (name, ', '.join(data)))
+            elif robot.task is not None and name in self.fleet.legs and \
+                    self.fleet.legs[name].kind != LEG:
+                someone_waits = True              # deferred: its zone is taken for now
+            self.waiting[name] = data if what == 'wait' else []
+        signature = self.fleet.progress_signature()
+        if signature != self.signature or not someone_waits:
+            self.signature, self.last_progress = signature, now
+        elif now - self.last_progress > self.stall:
+            self.get_logger().warn('No robot got further for %.0f s' % self.stall)
+            self.request_replan('stalled')
+
+    def replan(self, now):
+        goals = {n: self.leg_target(r) for n, r in self.robots.items()}
+        urgent = sorted((r.task.id, n) for n, r in self.robots.items() if r.task)
+        t0 = time.monotonic()
+        result = self.fleet.plan(goals, [n for _, n in urgent])
+        self.method = result['method']
+        holding = [n for n in result['deferred'] if n not in result['staging']]
+        self.get_logger().info(
+            'Plan by %s in %.2f s: moving %s, queuing near a busy zone %s, holding %s, '
+            'making way %s' % (result['method'], time.monotonic() - t0,
+                               result['planned'] or '-', result['staging'] or '-',
+                               holding or '-', result['make_way'] or '-'))
+        for name, pub in self.path_pubs.items():
+            path = Path()
+            path.header.frame_id = 'map'
+            path.header.stamp = self.get_clock().now().to_msg()
+            path.poses = [self.make_pose(*self.grid.cell_to_world(c), 0.0)
+                          for c in self.fleet.legs[name].cells]
+            pub.publish(path)
+        self.signature, self.last_progress = None, now
+
+    def leg_target(self, robot):
+        task = robot.task
+        if task is None:
+            return None
+        return LOCATIONS[task.pickup if task.state == TO_PICKUP else task.delivery]
+
+    def stop_all(self):
+        for robot in self.robots.values():
+            robot.gen += 1
+            if robot.handle is not None:
+                robot.handle.cancel_goal_async()
+            robot.handle = None
+            robot.driving = False
+        self.fleet.stop_all()
+
+    # ---- one segment = waypoints -> Nav2 -------------------------------------
+    def send_segment(self, name, waypoints):
         robot = self.robots[name]
-        waypoints = plan_waypoints(self.grid, robot.xy, target_xy, 0.0)
-        if waypoints is None:
-            return self.fail(name, 'A* found no path')
-        if not waypoints:
-            return self.leg_done(name)             # already there
-        if not robot.client.server_is_ready():
-            return self.fail(name, 'Nav2 action server not available')
+        robot.segment = waypoints
+        robot.finishing = False
+        if len(waypoints) == 1:                   # one pose: navigate_to_pose has no quirk
+            return self.send_to_pose(name, waypoints[0])
         goal = NavigateThroughPoses.Goal()
         goal.poses = [self.make_pose(*w) for w in waypoints]
-        future = robot.client.send_goal_async(goal)
-        future.add_done_callback(lambda f, n=name: self.on_goal_response(n, f))
+        self.send_goal(name, robot.client, goal)
 
-    def on_goal_response(self, name, future):
+    def send_to_pose(self, name, waypoint):
+        goal = NavigateToPose.Goal()
+        goal.pose = self.make_pose(*waypoint)
+        self.send_goal(name, self.robots[name].to_client, goal)
+
+    def send_goal(self, name, client, goal):
+        robot = self.robots[name]
+        robot.driving = True
+        gen = robot.gen
+        future = client.send_goal_async(goal)
+        future.add_done_callback(lambda f, n=name, g=gen: self.on_goal_response(n, g, f))
+
+    def on_goal_response(self, name, gen, future):
+        robot = self.robots[name]
         handle = future.result()
-        if not handle.accepted:
-            return self.fail(name, 'Nav2 rejected the goal')
+        if gen != robot.gen:                      # sent before the last stop: drop it
+            if handle.accepted:
+                handle.cancel_goal_async()
+            return
+        if not handle.accepted:                   # usually Nav2 still starting up: wait, resend
+            robot.driving = False
+            robot.rejections += 1
+            if robot.rejections > MAX_REJECTIONS:
+                return self.fail(name, 'Nav2 keeps rejecting goals')
+            if robot.rejections == 1:
+                self.get_logger().warn('%s: Nav2 is not accepting goals yet (still starting?), '
+                                       'retrying every %.0f s' % (name, RETRY_DELAY))
+            self.fleet.cancel_segment(name)
+            robot.hold_until = self.now() + RETRY_DELAY
+            return
+        robot.rejections = 0
+        robot.handle = handle
         handle.get_result_async().add_done_callback(
-            lambda f, n=name: self.on_result(n, f))
+            lambda f, n=name, g=gen: self.on_result(n, g, f))
 
-    def on_result(self, name, future):
+    def on_result(self, name, gen, future):
+        robot = self.robots[name]
+        if gen != robot.gen:
+            return
+        robot.handle = None
+        robot.driving = False
         status = future.result().status
         if status == SUCCEEDED:
-            self.leg_done(name)
-        else:
-            self.fail(name, 'Nav2 ended with status %d' % status)
+            self.fleet.on_segment_done(name)
+            return
+        end = robot.segment[-1] if robot.segment else None
+        if end and not robot.finishing and \
+                math.hypot(robot.xy[0] - end[0], robot.xy[1] - end[1]) <= FINISH_RADIUS:
+            robot.finishing = True                # Nav2 dropped the last pose just short of it
+            self.get_logger().info('%s: Nav2 stopped %.2f m short of the segment end, '
+                                   'finishing with navigate_to_pose'
+                                   % (name, math.hypot(robot.xy[0] - end[0],
+                                                       robot.xy[1] - end[1])))
+            return self.send_to_pose(name, end)
+        if robot.task is not None and robot.retries < MAX_RETRIES:
+            robot.retries += 1
+            self.get_logger().warn('%s: Nav2 aborted the drive (status %d), replanning and '
+                                   'retrying (%d/%d)' % (name, status, robot.retries, MAX_RETRIES))
+            return self.request_replan('%s retry' % name)
+        self.fail(name, 'Nav2 ended with status %d' % status)
 
     def leg_done(self, name):
         robot = self.robots[name]
         task = robot.task
+        if task is None:
+            return
         if task.state == TO_PICKUP:
             self.get_logger().info('Task %d: %s picked up at %s' % (task.id, name, task.pickup))
             task.state = TO_DELIVERY
-            self.send_leg(name, LOCATIONS[task.delivery])
+            robot.retries = 0
+            self.request_replan('%s picked up' % name)
         elif task.state == TO_DELIVERY:
             self.get_logger().info('Task %d: DONE, %s delivered at %s'
                                    % (task.id, name, task.delivery))
             task.state = DONE
             robot.task = None
             robot.completed += 1
+            self.request_replan('%s delivered' % name)
 
     def fail(self, name, reason):
         robot = self.robots[name]
         task = robot.task
-        self.get_logger().error('Task %d FAILED on %s: %s' % (task.id, name, reason))
-        task.state = FAILED            # Phase 7 will release it for reassignment instead
-        robot.task = None
+        if task is None:
+            self.get_logger().error('%s: %s' % (name, reason))
+        else:
+            self.get_logger().error('Task %d FAILED on %s: %s' % (task.id, name, reason))
+            task.state = FAILED        # Phase 7 will release it for reassignment instead
+            robot.task = None
+        self.request_replan('%s failed' % name)   # others may be waiting for it
 
     # ---- helpers ------------------------------------------------------------
     def make_pose(self, x, y, yaw):
@@ -179,8 +379,10 @@ class TaskManager(Node):
         msg.data = json.dumps({
             'tasks': [{'id': t.id, 'pickup': t.pickup, 'delivery': t.delivery,
                        'state': t.state, 'robot': t.robot} for t in self.tasks],
-            'robots': {n: {'task': r.task.id if r.task else None, 'completed': r.completed}
+            'robots': {n: {'task': r.task.id if r.task else None, 'completed': r.completed,
+                           'driving': r.driving, 'waiting_for': self.waiting.get(n, [])}
                        for n, r in self.robots.items()},
+            'plan': self.method,
         })
         self.status_pub.publish(msg)
 
