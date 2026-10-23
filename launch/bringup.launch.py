@@ -1,4 +1,5 @@
-"""Start the whole system with one command:
+"""
+Start the whole system with one command.
 
   ros2 launch ugp_warehouse bringup.launch.py
 
@@ -41,6 +42,9 @@ def generate_launch_description():
             for i, r in enumerate(ROBOTS)]
     return LaunchDescription([
         sim,
+        Node(package='ugp_warehouse', executable='coordinator',
+             name='multi_robot_coordinator', output='screen',
+             parameters=[{'algorithm': 'cbs'}]),
         TimerAction(period=12.0, actions=map_and_tf),
         TimerAction(period=24.0, actions=amcl),
         TimerAction(period=38.0, actions=nav2),

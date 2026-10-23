@@ -1,8 +1,9 @@
 # UGP: Resilient Multi-Robot Warehouse Logistics
 
 ROS 2 Jazzy + Gazebo Harmonic + Nav2 simulation of differential-drive robots in a warehouse.
-Current state: two robots with Nav2 and AMCL, A* planning, task assignment, and
-prioritized space-time coordination. CBS and failure recovery are later phases.
+Current state: two robots with Nav2 and AMCL, A* planning, task assignment,
+space-time coordination, prioritized planning, and Conflict-Based Search (CBS).
+Failure recovery remains future work.
 
 ## Requirements
 
@@ -61,14 +62,32 @@ ros2 run ugp_warehouse task_manager --ros-args -p use_sim_time:=true \
 Run the Phase 5 space-time coordinator tests (no ROS or simulator required):
 ```bash
 python3 ugp_warehouse/test_space_time.py
+python3 ugp_warehouse/test_tasks.py
+cd ugp_warehouse && python3 test_astar.py && cd ..
 ```
 The tests cover crossing routes with a scheduled wait, shared-goal exclusion,
-opposing routes in a narrow corridor, and swap-conflict detection. When the task
-manager assigns multiple tasks at once, it coordinates their pickup routes
-before sending them to Nav2. A route that cannot be scheduled is reported as
-failed rather than sent through a known conflict. Delivery legs still use the
-existing per-robot A* waypoint planner; dynamic replanning and failure recovery
-are not part of this phase.
+opposing routes in a narrow corridor, and swap-conflict detection and resolution
+with CBS. The standalone ROS coordinator node accepts JSON route requests on
+`/coordination/request` and publishes plans on `/coordination/response`. The
+`bringup.launch.py` launch starts this node, and the task manager uses CBS to
+coordinate pickup routes and then delivery routes before sending them to Nav2.
+CBS reports deadlocked or infeasible route sets rather than returning paths
+with known vertex or swap conflicts. The prioritized planner remains available
+as an alternative coordinator algorithm by starting the task manager with
+`-p coordination_algorithm:=prioritized`. Space-time steps default to 2
+simulation seconds per 0.25 m grid move (`time_step_seconds` can be overridden);
+Nav2 motion still varies, so the Gazebo run must be visually checked.
+
+For a fast two-agent simulation check, after both Nav2 navigators are active,
+run this in a sourced terminal:
+```bash
+ros2 run ugp_warehouse task_manager --ros-args -p use_sim_time:=true \
+  -p "tasks:=['P1:D1','P2:D2']"
+```
+The coordinator node should already be running from `bringup.launch.py`.
+Verify that task-manager logs show both tasks assigned, picked up, and delivered.
+The discrete planner's timing is an approximation of Nav2 motion; confirm robot
+separation in Gazebo as well as checking the unit tests.
 
 Send the robot to delivery zone D1 (east side):
 ```bash

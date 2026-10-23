@@ -1,4 +1,5 @@
 from glob import glob
+
 from setuptools import find_packages, setup
 
 package_name = 'ugp_warehouse'
@@ -27,6 +28,7 @@ setup(
         'console_scripts': [
             'drive_test = ugp_warehouse.drive_test:main',
             'astar_nav = ugp_warehouse.astar_nav:main',
+            'coordinator = ugp_warehouse.coordinator:main',
             'tf_relay = ugp_warehouse.tf_relay:main',
             'task_manager = ugp_warehouse.task_manager:main',
         ],

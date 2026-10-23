@@ -1,9 +1,10 @@
-"""task_manager: creates pickup/delivery tasks, assigns them to robots, tracks them.
+"""
+Create and assign pickup/delivery tasks, then track robot progress.
 
 Roles in the project pipeline (kept separate on purpose):
   * Task manager (this node) : owns the task list and each task's state.
   * Assignment (tasks.py)    : decides WHO does a task (A* cost + load balancing).
-  * Coordinator (space_time.py): schedules simultaneous pickup routes.
+  * Coordinator (coordinator.py): schedules pickup and delivery routes.
   * A* (astar_nav.plan_waypoints): decides HOW the robot gets there (waypoints).
   * Nav2                     : drives the robot along those waypoints.
 
@@ -23,11 +24,12 @@ ROS interfaces
 import json
 import math
 import os
+import time
 
-import rclpy
 from ament_index_python.packages import get_package_share_directory
 from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
 from nav2_msgs.action import NavigateThroughPoses
+import rclpy
 from rclpy.action import ActionClient
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
@@ -38,9 +40,8 @@ from ugp_warehouse.astar_nav import plan_waypoints
 from ugp_warehouse.grid_map import GridMap
 from ugp_warehouse.locations import LOCATIONS
 from ugp_warehouse.robots import ROBOTS
-from ugp_warehouse.space_time import MultiRobotCoordinator
-from ugp_warehouse.tasks import (DONE, FAILED, PENDING, TO_DELIVERY, TO_PICKUP,
-                                 Task, assign)
+from ugp_warehouse.tasks import (assign, DONE, FAILED, PENDING, Task,
+                                 TO_DELIVERY, TO_PICKUP)
 
 SUCCEEDED = 4                                     # action_msgs GoalStatus.STATUS_SUCCEEDED
 
@@ -63,9 +64,20 @@ class TaskManager(Node):
         self.declare_parameter('map_yaml', os.path.join(
             get_package_share_directory('ugp_warehouse'), 'config', 'warehouse_map.yaml'))
         self.grid = GridMap.from_yaml(self.get_parameter('map_yaml').value)
-        self.declare_parameter('time_step_seconds', 1.0)
-        self.coordinator = MultiRobotCoordinator(self.grid)
+        self.declare_parameter('time_step_seconds', 2.0)
         self.time_step_seconds = self.get_parameter('time_step_seconds').value
+        self.declare_parameter('coordination_algorithm', 'cbs')
+        self.declare_parameter('coordination_timeout_seconds', 30.0)
+        self.coordination_algorithm = self.get_parameter(
+            'coordination_algorithm').value
+        self.coordination_timeout_seconds = self.get_parameter(
+            'coordination_timeout_seconds').value
+        self.coordination_pub = self.create_publisher(
+            String, '/coordination/request', 10)
+        self.create_subscription(
+            String, '/coordination/response', self.on_coordination_response, 10)
+        self.coordination_requests = {}
+        self.request_sequence = 0
         self.tasks = []
         for i, spec in enumerate(self.get_parameter('tasks').value, start=1):
             pickup, delivery = spec.split(':')
@@ -94,11 +106,14 @@ class TaskManager(Node):
 
     # ---- main loop (1 Hz): hand pending tasks to idle robots ----------------
     def tick(self):
+        self.publish_pending_coordination_requests()
+        self.expire_coordination_requests()
         idle = {n: {'xy': r.xy, 'completed': r.completed}
                 for n, r in self.robots.items()
                 if r.task is None and r.client.server_is_ready()}
         pending = [t for t in self.tasks if t.state == PENDING]
-        if idle and pending:
+        active = any(robot.task is not None for robot in self.robots.values())
+        if idle and pending and not active:
             assigned, infeasible = assign(self.grid, pending, idle, LOCATIONS)
             for t in infeasible:
                 t.state = FAILED
@@ -109,7 +124,7 @@ class TaskManager(Node):
                 self.start_task(task, name, cost)
                 started.append((task, name))
             if started:
-                self.dispatch_coordinated_legs(started)
+                self.request_coordinated_routes(started, TO_PICKUP)
         self.publish_status()
         if not self.finished_logged and all(t.state in (DONE, FAILED) for t in self.tasks):
             self.finished_logged = True
@@ -124,23 +139,106 @@ class TaskManager(Node):
         task.state = TO_PICKUP
         self.robots[name].task = task
 
-    def dispatch_coordinated_legs(self, assignments):
+    def request_coordinated_routes(self, assignments, state):
         agents = {}
         task_by_robot = {}
         for task, name in assignments:
             start = self.grid.nearest_free(self.grid.world_to_cell(*self.robots[name].xy))
-            goal = self.grid.world_to_cell(*LOCATIONS[task.pickup])
+            target = task.pickup if state == TO_PICKUP else task.delivery
+            goal = self.grid.world_to_cell(*LOCATIONS[target])
             if start is None:
                 self.fail(name, 'no free start cell for coordinated planning')
                 continue
             agents[name] = (start, goal)
             task_by_robot[name] = task
-        paths, unplanned = self.coordinator.plan(agents)
+        if not agents:
+            return
+        self.request_sequence += 1
+        request_id = '%s-%d' % (self.get_name(), self.request_sequence)
+        self.coordination_requests[request_id] = {
+            'tasks': task_by_robot,
+            'state': state,
+            'agents': agents,
+            'deadline': time.monotonic() + self.coordination_timeout_seconds,
+            'published': False,
+        }
+
+    def publish_pending_coordination_requests(self):
+        if self.coordination_pub.get_subscription_count() == 0:
+            return
+        for request_id, request in self.coordination_requests.items():
+            if request['published']:
+                continue
+            message = String()
+            message.data = json.dumps({
+                'request_id': request_id,
+                'algorithm': self.coordination_algorithm,
+                'agents': {
+                    name: {'start': list(start), 'goal': list(goal)}
+                    for name, (start, goal) in request['agents'].items()
+                },
+            })
+            self.coordination_pub.publish(message)
+            request['published'] = True
+
+    def expire_coordination_requests(self):
+        now = time.monotonic()
+        expired = [
+            request_id for request_id, request in self.coordination_requests.items()
+            if now >= request['deadline']]
+        for request_id in expired:
+            request = self.coordination_requests.pop(request_id)
+            for name in request['tasks']:
+                self.fail(name, 'coordinator response timed out')
+
+    def on_coordination_response(self, message):
+        request_id = None
+        try:
+            response = json.loads(message.data)
+            request_id = response['request_id']
+            request = self.coordination_requests.get(request_id)
+            if request is None:
+                self.get_logger().warning(
+                    'Ignoring unknown coordination response %s' % request_id)
+                return
+            paths = response.get('paths', {})
+            unplanned = set(response.get('unplanned', []))
+            if response.get('error'):
+                raise ValueError(response['error'])
+            if not isinstance(paths, dict):
+                raise ValueError('coordinator paths must be an object')
+            if not unplanned.issubset(request['tasks']):
+                raise ValueError('coordinator returned an unknown robot')
+            parsed_paths = {}
+            for name, raw_path in paths.items():
+                if name not in request['tasks']:
+                    raise ValueError('coordinator returned unknown robot %s' % name)
+                path = [tuple(cell) for cell in raw_path]
+                if not path or any(
+                        len(cell) != 2 or
+                        any(type(value) is not int for value in cell)
+                        for cell in path):
+                    raise ValueError('coordinator returned an invalid path for %s' % name)
+                parsed_paths[name] = path
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            self.get_logger().error('Invalid coordination response: %s' % error)
+            request = self.coordination_requests.pop(request_id, None)
+            if request is not None:
+                for name in request['tasks']:
+                    self.fail(name, 'coordinator returned an invalid response')
+            return
+
+        self.coordination_requests.pop(request_id)
         for name in unplanned:
-            task = task_by_robot[name]
-            self.fail(name, 'coordinator found no conflict-free route to pickup')
-        for name, path in paths.items():
-            self.send_leg(name, LOCATIONS[task_by_robot[name].pickup], path)
+            self.fail(name, 'coordinator found no conflict-free route')
+        for name, path in parsed_paths.items():
+            if name not in unplanned:
+                task = request['tasks'][name]
+                target_key = task.pickup if request['state'] == TO_PICKUP else task.delivery
+                self.send_leg(name, LOCATIONS[target_key], path)
+        missing = set(request['tasks']) - unplanned - set(parsed_paths)
+        for name in missing:
+            self.fail(name, 'coordinator returned no route')
 
     # ---- one leg = A* waypoints -> Nav2 -------------------------------------
     def send_leg(self, name, target_xy, cell_path=None):
@@ -241,7 +339,14 @@ class TaskManager(Node):
         if task.state == TO_PICKUP:
             self.get_logger().info('Task %d: %s picked up at %s' % (task.id, name, task.pickup))
             task.state = TO_DELIVERY
-            self.send_leg(name, LOCATIONS[task.delivery])
+            active = [
+                (robot.task, robot.name)
+                for robot in self.robots.values()
+                if robot.task is not None
+            ]
+            if active and all(active_task.state == TO_DELIVERY
+                              for active_task, _ in active):
+                self.request_coordinated_routes(active, TO_DELIVERY)
         elif task.state == TO_DELIVERY:
             self.get_logger().info('Task %d: DONE, %s delivered at %s'
                                    % (task.id, name, task.delivery))
