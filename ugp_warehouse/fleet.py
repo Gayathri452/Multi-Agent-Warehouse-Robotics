@@ -78,6 +78,11 @@ class Fleet:
         leg.progress = max(leg.progress, leg.seg_end)
         leg.seg_end = None
 
+    def cancel_segment(self, name):
+        """Nav2 never started the segment in flight: next_segment will offer it again."""
+        if name in self.legs:
+            self.legs[name].seg_end = None
+
     def stop_all(self):
         """Robots were stopped (replanning): forget segments in flight."""
         for leg in self.legs.values():

@@ -27,6 +27,11 @@ Parameters
   settle_seconds (1.0)   pause after stopping the robots, before replanning
   stall_seconds  (20.0)  replan if someone waits and no robot got further for this long
 
+Nav2 hiccups are retried, not failed: a goal rejected while Nav2 is still starting
+is resent every RETRY_DELAY seconds, and a drive Nav2 aborts (e.g. "Resulting plan
+has 0 poses" when the controller loses track of its path) triggers a joint replan
+from where the robots are, up to MAX_RETRIES times per leg.
+
 Nav2 quirk handled here: navigate_through_poses drops a pose once the robot is
 within 0.7 m of it (RemovePassedGoals). If that was the LAST pose, Nav2 aborts with
 "Resulting plan has 0 poses". So one-pose segments use navigate_to_pose, and a
@@ -64,6 +69,9 @@ from ugp_warehouse.tasks import (DONE, FAILED, PENDING, TO_DELIVERY, TO_PICKUP,
 
 SUCCEEDED = 4                                     # action_msgs GoalStatus.STATUS_SUCCEEDED
 FINISH_RADIUS = 1.0      # m: an abort this close to the segment end is Nav2's dropped last pose
+MAX_RETRIES = 3          # Nav2 aborts tolerated per leg before the task is marked FAILED
+RETRY_DELAY = 3.0        # s to wait before resending a goal Nav2 rejected
+MAX_REJECTIONS = 40      # about two minutes of rejections: Nav2 is not coming up
 
 
 class Robot:
@@ -79,6 +87,9 @@ class Robot:
         self.driving = False
         self.segment = None                       # waypoints of the segment in flight
         self.finishing = False                    # True while finishing it with navigate_to_pose
+        self.retries = 0                          # Nav2 aborts on the current leg
+        self.rejections = 0                       # goals rejected in a row (Nav2 starting up)
+        self.hold_until = 0.0                     # do not send goals before this time
 
     def ready(self):
         return self.client.server_is_ready() and self.to_client.server_is_ready()
@@ -170,6 +181,7 @@ class TaskManager(Node):
         task.robot = name
         task.state = TO_PICKUP
         self.robots[name].task = task
+        self.robots[name].retries = 0
 
     # ---- control loop (5 Hz): replan when needed, release robots that may drive ----
     def request_replan(self, reason):
@@ -192,7 +204,7 @@ class TaskManager(Node):
             self.replan(now)
         someone_waits = False
         for name, robot in self.robots.items():
-            if robot.driving or not robot.ready():
+            if robot.driving or not robot.ready() or now < robot.hold_until:
                 continue
             what, data = self.fleet.next_segment(name)
             if what == 'drive':
@@ -280,9 +292,18 @@ class TaskManager(Node):
             if handle.accepted:
                 handle.cancel_goal_async()
             return
-        if not handle.accepted:
+        if not handle.accepted:                   # usually Nav2 still starting up: wait, resend
             robot.driving = False
-            return self.fail(name, 'Nav2 rejected the goal')
+            robot.rejections += 1
+            if robot.rejections > MAX_REJECTIONS:
+                return self.fail(name, 'Nav2 keeps rejecting goals')
+            if robot.rejections == 1:
+                self.get_logger().warn('%s: Nav2 is not accepting goals yet (still starting?), '
+                                       'retrying every %.0f s' % (name, RETRY_DELAY))
+            self.fleet.cancel_segment(name)
+            robot.hold_until = self.now() + RETRY_DELAY
+            return
+        robot.rejections = 0
         robot.handle = handle
         handle.get_result_async().add_done_callback(
             lambda f, n=name, g=gen: self.on_result(n, g, f))
@@ -306,6 +327,11 @@ class TaskManager(Node):
                                    % (name, math.hypot(robot.xy[0] - end[0],
                                                        robot.xy[1] - end[1])))
             return self.send_to_pose(name, end)
+        if robot.task is not None and robot.retries < MAX_RETRIES:
+            robot.retries += 1
+            self.get_logger().warn('%s: Nav2 aborted the drive (status %d), replanning and '
+                                   'retrying (%d/%d)' % (name, status, robot.retries, MAX_RETRIES))
+            return self.request_replan('%s retry' % name)
         self.fail(name, 'Nav2 ended with status %d' % status)
 
     def leg_done(self, name):
@@ -316,6 +342,7 @@ class TaskManager(Node):
         if task.state == TO_PICKUP:
             self.get_logger().info('Task %d: %s picked up at %s' % (task.id, name, task.pickup))
             task.state = TO_DELIVERY
+            robot.retries = 0
             self.request_replan('%s picked up' % name)
         elif task.state == TO_DELIVERY:
             self.get_logger().info('Task %d: DONE, %s delivered at %s'
