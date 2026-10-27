@@ -1,7 +1,9 @@
 # UGP: Resilient Multi-Robot Warehouse Logistics
 
 ROS 2 Jazzy + Gazebo Harmonic + Nav2 simulation of differential-drive robots in a warehouse.
-Current state: one robot (`robot_1`) navigating with Nav2 and AMCL. A*, MAPF/CBS, task assignment and failure recovery are added in later phases.
+Current state: two robots with Nav2 and AMCL, A* planning, task assignment,
+prioritized space-time coordination (Phase 5) and CBS coordination of every leg
+(Phase 6, used by the task manager), and failure detection and recovery (Phase 7).
 
 ## Requirements
 
@@ -36,23 +38,39 @@ If other people share your network, pick your own number so you do not see their
 export ROS_DOMAIN_ID=42
 ```
 
-## Run (4 terminals, in this order)
+## Run
 
-| # | Command | Wait for |
-|---|---|---|
-| 1 | `ros2 launch ugp_warehouse warehouse.launch.py` | Gazebo opens and the orange robot appears (about 10 s) |
-| 2 | `ros2 launch ugp_warehouse map.launch.py` | map server active |
-| 3 | `ros2 launch ugp_warehouse amcl.launch.py` | "Received a 400 X 280 map" |
-| 4 | `ros2 launch ugp_warehouse nav2.launch.py` | all Nav2 nodes active (about 20 s) |
-
-Starting Nav2 before AMCL fails, because Nav2 needs the `map` frame that AMCL publishes.
-
-Check it is ready (terminal 5):
+Start the complete two-robot system:
+```bash
+ros2 launch ugp_warehouse bringup.launch.py
+```
+Wait for Gazebo, both robots, AMCL, and Nav2 to start. In another sourced
+terminal, check that both navigators are active:
 ```bash
 ros2 lifecycle get /robot_1/bt_navigator     # expect: active [3]
+ros2 lifecycle get /robot_2/bt_navigator     # expect: active [3]
+```
+
+Start a coordinated pickup-and-delivery run in another sourced terminal:
+```bash
+ros2 run ugp_warehouse task_manager --ros-args -p use_sim_time:=true \
+  -p "tasks:=['P1:D1','P2:D2']"
 ```
 
 ## Test
+
+Run the Phase 5 space-time coordinator tests (no ROS or simulator required):
+```bash
+python3 ugp_warehouse/test_space_time.py
+```
+The tests cover crossing routes with a scheduled wait, shared-goal exclusion,
+opposing routes in a narrow corridor, and swap-conflict detection. When the task
+manager assigns multiple tasks at once, it coordinates their pickup routes
+before sending them to Nav2. A route that cannot be scheduled is reported as
+failed rather than sent through a known conflict. (Phase 6 below replaces this:
+all legs are now coordinated.) Delivery legs still use the
+existing per-robot A* waypoint planner; dynamic replanning and failure recovery
+are not part of this phase.
 
 Send the robot to delivery zone D1 (east side):
 ```bash
@@ -68,6 +86,71 @@ Unreachable goal (inside a shelf) should end `ABORTED` with error code 208:
 ros2 action send_goal /robot_1/navigate_to_pose nav2_msgs/action/NavigateToPose \
   "{pose: {header: {frame_id: map}, pose: {position: {x: -4.5, y: 4.2}, orientation: {w: 1.0}}}}" --feedback
 ```
+
+## Phase 6: conflict resolution
+
+The task manager now plans every leg of every robot (pickup and delivery) together
+with CBS and paces the robots by progress, not by a clock:
+
+* Whenever a leg starts or ends, all robots stop for about a second and are planned
+  together from where they are (`fleet.py`, using `cbs.py`).
+* Each robot then drives in segments: up to the last cell it may enter, then it
+  waits until the robots it has to let pass have moved on. Nav2 driving faster or
+  slower than planned cannot make robots meet.
+* Two robots never head for the same zone at once. The robot with the older task
+  goes first; the other queues just outside the zone. An idle robot standing in
+  someone's way is moved aside.
+* Robots keep 1.25 m between centres: 0.76 m robot width + 0.1 m margin + Nav2's
+  0.25 m `xy_goal_tolerance`. If you lower that tolerance in the Nav2 params, pass the
+  same value as `goal_tolerance` and the separation shrinks automatically.
+
+The deliberate conflict (two robots driving the same aisle in opposite directions):
+```bash
+ros2 launch ugp_warehouse bringup.launch.py        # terminal 1, wait for both Nav2s
+ros2 run ugp_warehouse task_manager --ros-args -p use_sim_time:=true \
+  -p "tasks:=['P2:D1','D1:P1']"                   # terminal 2
+```
+Look for `Plan by cbs`, `robot_X waits for robot_Y to pass` and `queuing near a busy
+zone` in the log. In RViz, add Path displays for `/robot_1/planned_path` and
+`/robot_2/planned_path` to see the plans.
+
+Tests (no ROS needed):
+```bash
+cd ~/ugp_ws/src/ugp_warehouse/ugp_warehouse
+python3 test_cbs.py      # about 3 s: prioritized planning vs CBS, the head-on conflict
+python3 test_fleet.py    # about 70 s: full task runs in a simulator with random speeds,
+                         # Nav2-style stopping errors and AMCL-style pose updates
+```
+
+## Phase 7: failure detection and recovery
+
+The task manager watches two heartbeats per robot: its odometry from Gazebo
+(`/<robot>/odom`) and its Nav2 action servers. If either stops for 3 s the robot is
+**OUT OF SERVICE**: its task goes back in the queue and another robot takes it (a
+load already picked up is picked up again), the broken robot stays where it stopped
+and the others plan around it, keeping their usual distance. When it is healthy
+again for 10 s it is **BACK IN SERVICE** and gets tasks again. A robot that cannot
+get past something (Nav2 gives up after it stopped moving, or no progress for 25 s)
+marks the area ahead as blocked for 2 minutes and everyone replans around it. A task
+is tried on up to 3 robots before it is FAILED. Logic: `ugp_warehouse/health.py`.
+
+Tests (no ROS needed):
+```bash
+cd ~/ugp_ws/src/ugp_warehouse/ugp_warehouse
+python3 test_health.py   # heartbeats, timeouts, revival, stuck, blocked areas, attempts
+```
+
+Fault injection in Gazebo (run from `~/ugp_ws/src/ugp_warehouse`, in a third terminal,
+while the task manager is running):
+```bash
+bash scripts/fail_robot.sh robot_2     # robot_2's navigation crashes, wheels stop
+bash scripts/revive_robot.sh robot_2   # restart its Nav2 (leave that terminal open)
+bash scripts/block_route.sh            # drop a box in the north aisle at (-4.5, 2.7)
+bash scripts/unblock_route.sh          # remove the box again
+```
+Look for `OUT OF SERVICE`, `back in the queue`, `BACK IN SERVICE`, `route blocked
+near` and a last line like `All tasks finished: 4 done, 0 failed (1 handed to another
+robot after a failure)`.
 
 ## Visualise (optional)
 
@@ -102,4 +185,7 @@ Do this before restarting, or old nodes stay alive and cause strange errors.
 | `launch/` | `warehouse` (sim + robot), `map`, `amcl`, `nav2` |
 | `worlds/`, `models/` | Warehouse world and robot model |
 | `config/` | Occupancy map and Nav2 parameters |
-| `make_world.py`, `make_map.py`, `make_nav2_params.py` | Generators for the files above |# Multi-Agent-Warehouse-Robotics
+| `make_world.py`, `make_map.py`, `make_nav2_params.py` | Generators for the files above |
+| `ugp_warehouse/cbs.py`, `fleet.py` | Phase 6: CBS planning, and pacing robots along the plan |
+| `ugp_warehouse/health.py`, `scripts/` | Phase 7: heartbeats, recovery, fault injection |
+
