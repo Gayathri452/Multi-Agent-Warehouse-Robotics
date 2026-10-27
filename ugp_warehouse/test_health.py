@@ -125,6 +125,27 @@ def planning_tests():
     check('and still reaches D1', fleet.legs['robot_1'].kind == LEG and
           path[-1] == grid.world_to_cell(*d1))
 
+    # robot_2 broke down while robot_1 was passing close by: robot_1 must not be boxed in
+    fleet = Fleet(grid, ['robot_1', 'robot_2'], min_sep=sep)
+    dead = grid.world_to_cell(0.0, -2.7)
+    near = (dead[0], dead[1] - 3)                    # 0.75 m away, inside the usual 1.25 m
+    fleet.on_pose('robot_1', grid.cell_to_world(near))
+    fleet.on_pose('robot_2', grid.cell_to_world(dead))
+    result = fleet.plan({'robot_1': LOCATIONS['P2'], 'robot_2': None}, down={'robot_2'})
+    path = fleet.timed['robot_1']
+    closest = min(math.dist(at(path, t), dead) for t in range(len(path)))
+    check('robot already close to a broken one is not boxed in: it drives away',
+          result['planned'] == ['robot_1'] and closest >= 3 - 1e-9)
+
+    # a goal nobody can reach is reported as unreachable (not just waiting its turn)
+    tiny = GridMap(__import__('numpy').array([[True] * 7]), 1.0, 0.0, 0.0)
+    fleet = Fleet(tiny, ['a', 'b'], min_sep=1)
+    fleet.on_pose('a', tiny.cell_to_world((0, 0)))
+    fleet.on_pose('b', tiny.cell_to_world((0, 3)))   # broken, in a one-lane corridor
+    result = fleet.plan({'a': tiny.cell_to_world((0, 6)), 'b': None}, down={'b'})
+    check('goal behind a broken robot in a one-lane corridor: unreachable',
+          result['unreachable'] == ['a'] and result['planned'] == [])
+
     # a box closes the north aisle between P1 and the centre
     fleet = Fleet(grid, ['robot_1', 'robot_2'], min_sep=sep)
     fleet.on_pose('robot_1', p1)

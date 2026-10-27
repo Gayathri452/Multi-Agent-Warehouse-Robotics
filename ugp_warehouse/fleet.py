@@ -118,7 +118,9 @@ class Fleet:
         """goals: {name: (x, y) or None}. priority: names, most urgent first.
         obstacles: cells to keep out of. down: robots out of service (not moved).
 
-        Returns {'planned', 'deferred', 'staging', 'make_way', 'down', 'method'}.
+        Returns {'planned', 'deferred', 'staging', 'make_way', 'down', 'method',
+        'unreachable'}: unreachable robots were deferred because no plan gets them
+        to their goal (not just because another robot is using their zone).
         Always produces a plan: if the robots cannot all reach their goals, the
         least urgent ones are deferred (held) until a later plan.
         """
@@ -127,11 +129,17 @@ class Fleet:
         down = [n for n in self.names if n in set(down)]
         live = [n for n in self.names if n not in down]
         blocked = set(obstacles)
-        r = self.sep
-        for n in down:                             # keep the usual distance from it
+        for n in down:
+            # Keep the usual distance from it, but a working robot that is already
+            # closer must still be able to drive away: like two robots that start
+            # close together, nobody may get closer than the closest one is now.
             c = starts[n]
+            need2 = min([self.sep * self.sep] +
+                        [(starts[m][0] - c[0]) ** 2 + (starts[m][1] - c[1]) ** 2 for m in live])
+            r = int(math.isqrt(max(need2 - 1, 0)))
             blocked.update((c[0] + i, c[1] + j) for i in range(-r, r + 1)
-                           for j in range(-r, r + 1) if i * i + j * j < r * r)
+                           for j in range(-r, r + 1) if i * i + j * j < need2)
+            blocked.add(c)
         blocked.difference_update(starts[n] for n in live)
         self.grid = Masked(self.base, blocked)
 
@@ -139,10 +147,11 @@ class Fleet:
         order += [n for n in live if goals.get(n) is not None and n not in order]
         goal_cell = {n: self.grid.nearest_free(self.grid.world_to_cell(*goals[n]))
                      for n in order}
-        active, deferred = [], []
+        active, deferred, unreachable = [], [], []
         for n in order:              # one robot per zone at a time, oldest task first
             if goal_cell[n] is None:
                 deferred.append(n)
+                unreachable.append(n)
             elif any(self._close(goal_cell[n], goal_cell[m]) for m in active):
                 deferred.append(n)
             else:
@@ -166,6 +175,7 @@ class Fleet:
             if paths is not None or not active:
                 break
             deferred.append(active.pop())          # least urgent robot waits for now
+            unreachable.append(deferred[-1])
         if paths is None:                          # should not happen: everyone stays put
             paths = [[starts[n]] for n in live]
             method = 'everyone holds (%s)' % method
@@ -174,6 +184,7 @@ class Fleet:
                       goals, active, deferred, starts)
         kinds = {n: self.legs[n].kind for n in self.names}
         return {'planned': active, 'deferred': deferred, 'method': method, 'down': down,
+                'unreachable': unreachable,
                 'staging': [n for n in deferred if kinds[n] == STAGE],
                 'make_way': [n for n in live if kinds[n] == MAKE_WAY]}
 

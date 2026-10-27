@@ -93,6 +93,7 @@ MAX_RETRIES = 3          # Nav2 aborts tolerated per leg before the robot gives 
 RETRY_DELAY = 3.0        # s to wait before resending a goal Nav2 rejected
 MAX_REJECTIONS = 40      # about two minutes of rejections: Nav2 is not coming up
 BLOCKED_AFTER = 8.0      # s: an abort after standing still this long means the route is blocked
+UNREACHABLE_LIMIT = 60.0  # s a robot may be unable to reach its goal before giving the task back
 
 
 class Robot:
@@ -111,6 +112,7 @@ class Robot:
         self.retries = 0                          # Nav2 aborts on the current leg
         self.rejections = 0                       # goals rejected in a row (Nav2 starting up)
         self.hold_until = 0.0                     # do not send goals before this time
+        self.unreachable_since = None             # first plan that could not reach its goal
 
     def ready(self):
         return self.client.server_is_ready() and self.to_client.server_is_ready()
@@ -298,6 +300,17 @@ class TaskManager(Node):
             'making way %s%s' % (result['method'], time.monotonic() - t0,
                                  result['planned'] or '-', result['staging'] or '-',
                                  holding or '-', result['make_way'] or '-', extra))
+        for name, robot in self.robots.items():  # no way to its goal for too long?
+            if robot.task is None or name not in result['unreachable']:
+                robot.unreachable_since = None
+            elif robot.unreachable_since is None:
+                robot.unreachable_since = now
+                self.get_logger().warn('%s cannot reach its goal right now (route or zone '
+                                       'blocked); waiting' % name)
+            elif now - robot.unreachable_since > UNREACHABLE_LIMIT:
+                robot.unreachable_since = None
+                self.give_back(name, '%s could not reach its goal for %.0f s'
+                               % (name, UNREACHABLE_LIMIT))
         for name, pub in self.path_pubs.items():
             path = Path()
             path.header.frame_id = 'map'
