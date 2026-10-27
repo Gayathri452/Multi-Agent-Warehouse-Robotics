@@ -19,6 +19,11 @@ Progress is only claimed once a robot has passed a cell's centre (from AMCL), or
 when Nav2 reports the segment done. Nav2 may stop up to `stop_tolerance` short,
 so that slack is added to the robots' separation (see default_min_sep).
 
+Failures (Phase 7). plan() also takes `obstacles` (cells to avoid, e.g. a blocked
+aisle) and `down` (robots out of service). A robot that is down is not planned:
+it stands where it stopped and the cells around it count as blocked, so the other
+robots keep the usual separation from it.
+
 Goal clashes. Robots park on their goals, so two robots cannot head for the same
 zone at once. The robot with the older task goes first and the other holds
 ('deferred') until the next plan. An idle or deferred robot standing too close to
@@ -30,9 +35,11 @@ from collections import deque
 try:
     from ugp_warehouse.astar import simplify
     from ugp_warehouse.cbs import recommended_min_sep, resolve, wait_for_rules
+    from ugp_warehouse.grid_map import GridMap
 except ImportError:           # running a test from inside the package folder
     from astar import simplify
     from cbs import recommended_min_sep, resolve, wait_for_rules
+    from grid_map import GridMap
 
 LEG, HOLD, MAKE_WAY, STAGE = 'leg', 'hold', 'make_way', 'stage'
 
@@ -40,6 +47,23 @@ LEG, HOLD, MAKE_WAY, STAGE = 'leg', 'hold', 'make_way', 'stage'
 def default_min_sep(cell_size=0.25, robot_radius=0.38, stop_tolerance=0.25):
     """Separation in cells for live runs: robot size + 0.1 m + Nav2's xy_goal_tolerance."""
     return recommended_min_sep(cell_size, robot_radius, 0.1 + stop_tolerance)
+
+
+class Masked:
+    """The planning grid with extra cells marked blocked (failed robots, blocked aisles)."""
+
+    def __init__(self, base, blocked):
+        self.base = base
+        self.blocked = frozenset(blocked)
+
+    def __getattr__(self, name):                   # everything else: as the real grid
+        return getattr(self.base, name)
+
+    def is_free(self, cell):
+        return cell not in self.blocked and self.base.is_free(cell)
+
+    def nearest_free(self, cell, max_radius=6):
+        return GridMap.nearest_free(self, cell, max_radius)
 
 
 class Leg:
@@ -57,7 +81,8 @@ class Leg:
 
 class Fleet:
     def __init__(self, grid, names, min_sep=None, w=1.1, max_nodes=1500):
-        self.grid = grid
+        self.base = grid            # the map
+        self.grid = grid            # the map plus whatever is blocked right now
         self.names = list(names)
         self.sep = min_sep or default_min_sep(grid.cell)
         self.w = w
@@ -89,16 +114,29 @@ class Fleet:
             leg.seg_end = None
 
     # ---- planning ------------------------------------------------------------------
-    def plan(self, goals, priority=()):
+    def plan(self, goals, priority=(), obstacles=(), down=()):
         """goals: {name: (x, y) or None}. priority: names, most urgent first.
+        obstacles: cells to keep out of. down: robots out of service (not moved).
 
-        Returns {'planned': [...], 'deferred': [...], 'make_way': [...], 'method': str}.
+        Returns {'planned', 'deferred', 'staging', 'make_way', 'down', 'method'}.
         Always produces a plan: if the robots cannot all reach their goals, the
         least urgent ones are deferred (held) until a later plan.
         """
+        self.grid = self.base
         starts = self._start_cells()
-        order = [n for n in priority if goals.get(n) is not None]
-        order += [n for n in self.names if goals.get(n) is not None and n not in order]
+        down = [n for n in self.names if n in set(down)]
+        live = [n for n in self.names if n not in down]
+        blocked = set(obstacles)
+        r = self.sep
+        for n in down:                             # keep the usual distance from it
+            c = starts[n]
+            blocked.update((c[0] + i, c[1] + j) for i in range(-r, r + 1)
+                           for j in range(-r, r + 1) if i * i + j * j < r * r)
+        blocked.difference_update(starts[n] for n in live)
+        self.grid = Masked(self.base, blocked)
+
+        order = [n for n in priority if n in live and goals.get(n) is not None]
+        order += [n for n in live if goals.get(n) is not None and n not in order]
         goal_cell = {n: self.grid.nearest_free(self.grid.world_to_cell(*goals[n]))
                      for n in order}
         active, deferred = [], []
@@ -109,18 +147,19 @@ class Fleet:
                 deferred.append(n)
             else:
                 active.append(n)
-        while True:
+        paths, method = None, 'nobody to plan'
+        while live:
             for staging in (True, False):          # queue near the zone, else hold still
                 targets = {n: goal_cell[n] for n in active}
-                others = [n for n in self.names if n not in active]
+                others = [n for n in live if n not in active]
                 for i, n in enumerate(others):
                     avoid = list(targets.values()) + [starts[m] for m in others[i + 1:]]
                     if staging and n in deferred and goal_cell[n] is not None:
                         targets[n] = self._near(goal_cell[n], starts[n], avoid)
                     else:
                         targets[n] = self._near(starts[n], starts[n], avoid)
-                paths, method = resolve(self.grid, [starts[n] for n in self.names],
-                                        [targets[n] for n in self.names], self.sep,
+                paths, method = resolve(self.grid, [starts[n] for n in live],
+                                        [targets[n] for n in live], self.sep,
                                         self.w, self.max_nodes)
                 if paths is not None:
                     break
@@ -128,13 +167,25 @@ class Fleet:
                 break
             deferred.append(active.pop())          # least urgent robot waits for now
         if paths is None:                          # should not happen: everyone stays put
-            paths = [[starts[n]] for n in self.names]
+            paths = [[starts[n]] for n in live]
             method = 'everyone holds (%s)' % method
-        self._install(paths, goals, active, deferred, starts)
+        by_name = dict(zip(live, paths))
+        self._install([by_name.get(n, [starts[n]]) for n in self.names],
+                      goals, active, deferred, starts)
         kinds = {n: self.legs[n].kind for n in self.names}
-        return {'planned': active, 'deferred': deferred, 'method': method,
+        return {'planned': active, 'deferred': deferred, 'method': method, 'down': down,
                 'staging': [n for n in deferred if kinds[n] == STAGE],
-                'make_way': [n for n in self.names if kinds[n] == MAKE_WAY]}
+                'make_way': [n for n in live if kinds[n] == MAKE_WAY]}
+
+    def area_ahead(self, name, ahead=3, radius=4):
+        """Cells of a disc on the robot's route `ahead` cells past where it is now:
+        where the obstacle that stopped it most likely is."""
+        leg = self.legs.get(name)
+        if leg is None:
+            return set()
+        c = leg.cells[min(leg.progress + ahead, len(leg.cells) - 1)]
+        return {(c[0] + i, c[1] + j) for i in range(-radius, radius + 1)
+                for j in range(-radius, radius + 1) if i * i + j * j < radius * radius}
 
     def _install(self, paths, goals, active, deferred, starts):
         index = {n: i for i, n in enumerate(self.names)}
