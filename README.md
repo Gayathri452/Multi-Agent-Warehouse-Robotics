@@ -3,7 +3,7 @@
 ROS 2 Jazzy + Gazebo Harmonic + Nav2 simulation of differential-drive robots in a warehouse.
 Current state: two robots with Nav2 and AMCL, A* planning, task assignment,
 prioritized space-time coordination (Phase 5) and CBS coordination of every leg
-(Phase 6, used by the task manager). Failure recovery is a later phase.
+(Phase 6, used by the task manager), and failure detection and recovery (Phase 7).
 
 ## Requirements
 
@@ -122,6 +122,36 @@ python3 test_fleet.py    # about 70 s: full task runs in a simulator with random
                          # Nav2-style stopping errors and AMCL-style pose updates
 ```
 
+## Phase 7: failure detection and recovery
+
+The task manager watches two heartbeats per robot: its odometry from Gazebo
+(`/<robot>/odom`) and its Nav2 action servers. If either stops for 3 s the robot is
+**OUT OF SERVICE**: its task goes back in the queue and another robot takes it (a
+load already picked up is picked up again), the broken robot stays where it stopped
+and the others plan around it, keeping their usual distance. When it is healthy
+again for 10 s it is **BACK IN SERVICE** and gets tasks again. A robot that cannot
+get past something (Nav2 gives up after it stopped moving, or no progress for 25 s)
+marks the area ahead as blocked for 2 minutes and everyone replans around it. A task
+is tried on up to 3 robots before it is FAILED. Logic: `ugp_warehouse/health.py`.
+
+Tests (no ROS needed):
+```bash
+cd ~/ugp_ws/src/ugp_warehouse/ugp_warehouse
+python3 test_health.py   # heartbeats, timeouts, revival, stuck, blocked areas, attempts
+```
+
+Fault injection in Gazebo (run from `~/ugp_ws/src/ugp_warehouse`, in a third terminal,
+while the task manager is running):
+```bash
+bash scripts/fail_robot.sh robot_2     # robot_2's navigation crashes, wheels stop
+bash scripts/revive_robot.sh robot_2   # restart its Nav2 (leave that terminal open)
+bash scripts/block_route.sh            # drop a box in the north aisle at (-4.5, 2.7)
+bash scripts/unblock_route.sh          # remove the box again
+```
+Look for `OUT OF SERVICE`, `back in the queue`, `BACK IN SERVICE`, `route blocked
+near` and a last line like `All tasks finished: 4 done, 0 failed (1 handed to another
+robot after a failure)`.
+
 ## Visualise (optional)
 
 ```bash
@@ -157,4 +187,5 @@ Do this before restarting, or old nodes stay alive and cause strange errors.
 | `config/` | Occupancy map and Nav2 parameters |
 | `make_world.py`, `make_map.py`, `make_nav2_params.py` | Generators for the files above |
 | `ugp_warehouse/cbs.py`, `fleet.py` | Phase 6: CBS planning, and pacing robots along the plan |
+| `ugp_warehouse/health.py`, `scripts/` | Phase 7: heartbeats, recovery, fault injection |
 
