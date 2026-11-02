@@ -1,7 +1,8 @@
 # UGP: Resilient Multi-Robot Warehouse Logistics
 
 ROS 2 Jazzy + Gazebo Harmonic + Nav2 simulation of differential-drive robots in a warehouse.
-Current state: one robot (`robot_1`) navigating with Nav2 and AMCL. A*, MAPF/CBS, task assignment and failure recovery are added in later phases.
+Current state: two robots with Nav2 and AMCL, A* planning, task assignment, and
+prioritized space-time coordination. CBS and failure recovery are later phases.
 
 ## Requirements
 
@@ -36,23 +37,38 @@ If other people share your network, pick your own number so you do not see their
 export ROS_DOMAIN_ID=42
 ```
 
-## Run (4 terminals, in this order)
+## Run
 
-| # | Command | Wait for |
-|---|---|---|
-| 1 | `ros2 launch ugp_warehouse warehouse.launch.py` | Gazebo opens and the orange robot appears (about 10 s) |
-| 2 | `ros2 launch ugp_warehouse map.launch.py` | map server active |
-| 3 | `ros2 launch ugp_warehouse amcl.launch.py` | "Received a 400 X 280 map" |
-| 4 | `ros2 launch ugp_warehouse nav2.launch.py` | all Nav2 nodes active (about 20 s) |
-
-Starting Nav2 before AMCL fails, because Nav2 needs the `map` frame that AMCL publishes.
-
-Check it is ready (terminal 5):
+Start the complete two-robot system:
+```bash
+ros2 launch ugp_warehouse bringup.launch.py
+```
+Wait for Gazebo, both robots, AMCL, and Nav2 to start. In another sourced
+terminal, check that both navigators are active:
 ```bash
 ros2 lifecycle get /robot_1/bt_navigator     # expect: active [3]
+ros2 lifecycle get /robot_2/bt_navigator     # expect: active [3]
+```
+
+Start a coordinated pickup-and-delivery run in another sourced terminal:
+```bash
+ros2 run ugp_warehouse task_manager --ros-args -p use_sim_time:=true \
+  -p "tasks:=['P1:D1','P2:D2']"
 ```
 
 ## Test
+
+Run the Phase 5 space-time coordinator tests (no ROS or simulator required):
+```bash
+python3 ugp_warehouse/test_space_time.py
+```
+The tests cover crossing routes with a scheduled wait, shared-goal exclusion,
+opposing routes in a narrow corridor, and swap-conflict detection. When the task
+manager assigns multiple tasks at once, it coordinates their pickup routes
+before sending them to Nav2. A route that cannot be scheduled is reported as
+failed rather than sent through a known conflict. Delivery legs still use the
+existing per-robot A* waypoint planner; dynamic replanning and failure recovery
+are not part of this phase.
 
 Send the robot to delivery zone D1 (east side):
 ```bash

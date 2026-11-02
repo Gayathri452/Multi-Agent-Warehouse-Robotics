@@ -3,6 +3,7 @@
 Roles in the project pipeline (kept separate on purpose):
   * Task manager (this node) : owns the task list and each task's state.
   * Assignment (tasks.py)    : decides WHO does a task (A* cost + load balancing).
+  * Coordinator (space_time.py): schedules simultaneous pickup routes.
   * A* (astar_nav.plan_waypoints): decides HOW the robot gets there (waypoints).
   * Nav2                     : drives the robot along those waypoints.
 
@@ -32,10 +33,12 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import String
 
+from ugp_warehouse.astar import simplify
 from ugp_warehouse.astar_nav import plan_waypoints
 from ugp_warehouse.grid_map import GridMap
 from ugp_warehouse.locations import LOCATIONS
 from ugp_warehouse.robots import ROBOTS
+from ugp_warehouse.space_time import MultiRobotCoordinator
 from ugp_warehouse.tasks import (DONE, FAILED, PENDING, TO_DELIVERY, TO_PICKUP,
                                  Task, assign)
 
@@ -49,6 +52,8 @@ class Robot:
         self.client = client
         self.task = None                          # the Task it is working on, or None (idle)
         self.completed = 0
+        self.segments = []
+        self.segment_index = 0
 
 
 class TaskManager(Node):
@@ -58,6 +63,9 @@ class TaskManager(Node):
         self.declare_parameter('map_yaml', os.path.join(
             get_package_share_directory('ugp_warehouse'), 'config', 'warehouse_map.yaml'))
         self.grid = GridMap.from_yaml(self.get_parameter('map_yaml').value)
+        self.declare_parameter('time_step_seconds', 1.0)
+        self.coordinator = MultiRobotCoordinator(self.grid)
+        self.time_step_seconds = self.get_parameter('time_step_seconds').value
         self.tasks = []
         for i, spec in enumerate(self.get_parameter('tasks').value, start=1):
             pickup, delivery = spec.split(':')
@@ -96,8 +104,12 @@ class TaskManager(Node):
                 t.state = FAILED
                 self.get_logger().error('Task %d (%s->%s) FAILED: no robot has a path'
                                         % (t.id, t.pickup, t.delivery))
+            started = []
             for task, name, cost in assigned:
                 self.start_task(task, name, cost)
+                started.append((task, name))
+            if started:
+                self.dispatch_coordinated_legs(started)
         self.publish_status()
         if not self.finished_logged and all(t.state in (DONE, FAILED) for t in self.tasks):
             self.finished_logged = True
@@ -111,16 +123,95 @@ class TaskManager(Node):
         task.robot = name
         task.state = TO_PICKUP
         self.robots[name].task = task
-        self.send_leg(name, LOCATIONS[task.pickup])
+
+    def dispatch_coordinated_legs(self, assignments):
+        agents = {}
+        task_by_robot = {}
+        for task, name in assignments:
+            start = self.grid.nearest_free(self.grid.world_to_cell(*self.robots[name].xy))
+            goal = self.grid.world_to_cell(*LOCATIONS[task.pickup])
+            if start is None:
+                self.fail(name, 'no free start cell for coordinated planning')
+                continue
+            agents[name] = (start, goal)
+            task_by_robot[name] = task
+        paths, unplanned = self.coordinator.plan(agents)
+        for name in unplanned:
+            task = task_by_robot[name]
+            self.fail(name, 'coordinator found no conflict-free route to pickup')
+        for name, path in paths.items():
+            self.send_leg(name, LOCATIONS[task_by_robot[name].pickup], path)
 
     # ---- one leg = A* waypoints -> Nav2 -------------------------------------
-    def send_leg(self, name, target_xy):
+    def send_leg(self, name, target_xy, cell_path=None):
         robot = self.robots[name]
-        waypoints = plan_waypoints(self.grid, robot.xy, target_xy, 0.0)
-        if waypoints is None:
-            return self.fail(name, 'A* found no path')
-        if not waypoints:
-            return self.leg_done(name)             # already there
+        if cell_path is None:
+            waypoints = plan_waypoints(self.grid, robot.xy, target_xy, 0.0)
+            if waypoints is None:
+                return self.fail(name, 'A* found no path')
+            if not waypoints:
+                return self.leg_done(name)         # already there
+            robot.segments = [(waypoints, 0)]
+        else:
+            robot.segments = self.make_segments(cell_path, target_xy)
+            if not robot.segments:
+                return self.leg_done(name)
+        robot.segment_index = 0
+        self.send_next_segment(name)
+
+    def make_segments(self, path, target_xy):
+        """Turn a scheduled cell path into Nav2 route chunks separated by waits."""
+        chunks = []
+        cells = [path[0]]
+        wait_steps = 0
+        for cell in path[1:]:
+            if cell == cells[-1]:
+                if len(cells) > 1:
+                    chunks.append((cells, wait_steps))
+                    cells = [cells[-1]]
+                    wait_steps = 0
+                wait_steps += 1
+            else:
+                cells.append(cell)
+        if len(cells) > 1:
+            chunks.append((cells, wait_steps))
+
+        segments = []
+        for index, (cells, delay) in enumerate(chunks):
+            corners = simplify(cells)[1:]
+            waypoints = []
+            for point_index, cell in enumerate(corners):
+                x, y = self.grid.cell_to_world(cell)
+                yaw = 0.0
+                if point_index < len(corners) - 1:
+                    nx, ny = self.grid.cell_to_world(corners[point_index + 1])
+                    yaw = math.atan2(ny - y, nx - x)
+                if index == len(chunks) - 1 and point_index == len(corners) - 1:
+                    x, y = target_xy
+                waypoints.append((x, y, yaw))
+            if waypoints:
+                segments.append((waypoints, delay))
+        return segments
+
+    def send_next_segment(self, name):
+        robot = self.robots[name]
+        if robot.segment_index >= len(robot.segments):
+            return self.leg_done(name)
+        waypoints, wait_steps = robot.segments[robot.segment_index]
+        if wait_steps:
+            timer = None
+
+            def resume():
+                timer.cancel()
+                self.send_action_segment(name, waypoints)
+
+            timer = self.create_timer(
+                wait_steps * self.time_step_seconds, resume)
+            return
+        self.send_action_segment(name, waypoints)
+
+    def send_action_segment(self, name, waypoints):
+        robot = self.robots[name]
         if not robot.client.server_is_ready():
             return self.fail(name, 'Nav2 action server not available')
         goal = NavigateThroughPoses.Goal()
@@ -138,7 +229,9 @@ class TaskManager(Node):
     def on_result(self, name, future):
         status = future.result().status
         if status == SUCCEEDED:
-            self.leg_done(name)
+            robot = self.robots[name]
+            robot.segment_index += 1
+            self.send_next_segment(name)
         else:
             self.fail(name, 'Nav2 ended with status %d' % status)
 
