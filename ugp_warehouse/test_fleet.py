@@ -18,6 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from fleet import LEG, Fleet, default_min_sep           # noqa: E402
 from grid_map import GridMap                             # noqa: E402
 from locations import LOCATIONS                          # noqa: E402
+from robots import ROBOTS                                 # noqa: E402
 from tasks import (DONE, PENDING, TO_DELIVERY, TO_PICKUP,  # noqa: E402
                    Task, assign)
 
@@ -188,7 +189,7 @@ if __name__ == '__main__':
     print('separation used live: %d cells = %.2f m' % (sep, sep * grid.cell))
     check('Nav2 tolerance 0.25 m -> 5 cells; tolerance 0.1 m -> 4 cells',
           sep == 5 and default_min_sep(grid.cell, stop_tolerance=0.1) == 4)
-    spawn = {'robot_1': (-8.0, 0.0), 'robot_2': (-8.3, -1.0)}
+    spawn = {name: (x, y) for name, x, y, _ in ROBOTS}
     scenario(grid, 'default tasks', spawn, ['P1:D1', 'P2:D2', 'P1:D2', 'P2:D1'], range(5))
     scenario(grid, 'shared pickup', spawn, ['P1:D1', 'P1:D2', 'P1:D1'], range(5))
     scenario(grid, 'head-on', spawn, ['P2:D1', 'D1:P1', 'P1:D2', 'D2:P2'], range(6))

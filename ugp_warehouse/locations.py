@@ -1,7 +1,7 @@
-"""Named places in the warehouse (map frame, metres). Same spots as the squares in the world."""
+"""Named pickup and delivery points in the warehouse (map frame, metres)."""
 LOCATIONS = {
-    'P1': (-8.2, 2.7),    # pickup 1   (west wall, north)
-    'P2': (-8.2, -2.7),   # pickup 2   (west wall, south)
-    'D1': (8.2, 2.7),     # delivery 1 (east wall, north)
-    'D2': (8.2, -2.7),    # delivery 2 (east wall, south)
+    'P1': (-7.0, -4.8),   # pickup 1: lower-left room
+    'P2': (-7.0, 4.8),    # pickup 2: upper-left room
+    'D1': (7.0, 4.8),     # delivery 1: upper-right room
+    'D2': (7.0, -4.8),    # delivery 2: lower-right room
 }

@@ -10,6 +10,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from astar import astar, simplify          # noqa: E402
 from grid_map import GridMap               # noqa: E402
+from locations import LOCATIONS               # noqa: E402
 
 MAP_YAML = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                         '..', 'config', 'warehouse_map.yaml')
@@ -97,8 +98,7 @@ def warehouse_tests():
     print('planning grid: %d rows x %d cols, cell %.2f m, free cells %d'
           % (grid.rows, grid.cols, grid.cell, int(grid.free.sum())))
 
-    spots = {'P1': (-8.2, 2.7), 'P2': (-8.2, -2.7), 'D1': (8.2, 2.7),
-             'D2': (8.2, -2.7), 'robot_1 start': (-8.0, 0.0)}
+    spots = {**LOCATIONS, 'robot_1 start': (-8.0, -4.8)}
     cells = {n: grid.world_to_cell(*xy) for n, xy in spots.items()}
     for n, c in cells.items():
         check('%s cell %s is free' % (n, c), grid.is_free(c))
@@ -113,8 +113,9 @@ def warehouse_tests():
               % (a, b, len(p or []), (len(p or []) - 1) * grid.cell, len(wp), ms))
         check('%s -> %s is a shortest path (matches BFS)' % (a, b), ok)
 
-    inside_shelf = grid.world_to_cell(-4.5, 4.2)
-    check('goal inside a shelf: no path', astar(grid, cells['P1'], inside_shelf) is None)
+    inside_wall = grid.world_to_cell(-4.5, 3.0)
+    check('goal inside a partition: no path',
+          astar(grid, cells['P1'], inside_wall) is None)
 
     random.seed(1)
     free_cells = [tuple(c) for c in np.argwhere(grid.free)]
