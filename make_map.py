@@ -2,6 +2,8 @@ import os
 
 import numpy as np
 
+from ugp_warehouse.layout import WALLS
+
 RES = 0.05                 # meters per pixel
 X0, Y0 = -10.0, -7.0       # world coords of the map's lower-left corner
 W, H = 400, 280            # pixels -> 20 m x 14 m
@@ -21,18 +23,10 @@ def box(cx, cy, sx, sy, value):
 # Room interior is free
 box(0, 0, 18, 12, FREE)
 
-# Outer walls (same as make_world.py)
-box(0, 6.1, 18.4, 0.2, OCC)
-box(0, -6.1, 18.4, 0.2, OCC)
-box(9.1, 0, 0.2, 12, OCC)
-box(-9.1, 0, 0.2, 12, OCC)
+for _, x, y, sx, sy in WALLS:
+    box(x, y, sx, sy, OCC)
 
-# Shelves: 6.0 x 0.6 m, four rows, two per row
-for y in (4.2, 1.2, -1.2, -4.2):
-    box(-4.5, y, 6, 0.6, OCC)
-    box(4.5, y, 6, 0.6, OCC)
-
-out_dir = os.path.expanduser('~/ugp_ws/src/ugp_warehouse/config')
+out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config')
 os.makedirs(out_dir, exist_ok=True)
 
 with open(os.path.join(out_dir, 'warehouse_map.pgm'), 'wb') as f:

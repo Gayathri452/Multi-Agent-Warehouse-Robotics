@@ -6,7 +6,7 @@ Division of labour (this is the project's core idea):
 
 Run (needs sim, map server, AMCL and Nav2 running):
   ros2 run ugp_warehouse astar_nav --ros-args -p use_sim_time:=true \
-      -p goal_x:=8.2 -p goal_y:=-2.7
+      -p goal_x:=7.0 -p goal_y:=-4.8
 
 ROS interfaces
   subscribes : /<robot>/amcl_pose   geometry_msgs/PoseWithCovarianceStamped
@@ -92,8 +92,8 @@ class AStarNav(Node):
     def __init__(self):
         super().__init__('astar_nav')
         self.declare_parameter('robot', 'robot_1')
-        self.declare_parameter('goal_x', 8.2)
-        self.declare_parameter('goal_y', 2.7)
+        self.declare_parameter('goal_x', 7.0)
+        self.declare_parameter('goal_y', 4.8)
         self.declare_parameter('goal_yaw', 0.0)
         self.declare_parameter('map_yaml', os.path.join(
             get_package_share_directory('ugp_warehouse'), 'config', 'warehouse_map.yaml'))

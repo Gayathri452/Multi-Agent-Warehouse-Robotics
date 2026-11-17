@@ -1,5 +1,12 @@
 import os
 
+from ugp_warehouse.layout import WALLS
+from ugp_warehouse.locations import LOCATIONS
+
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+WORLD_PATH = os.path.join(HERE, 'worlds', 'warehouse.sdf')
+
 HEAD = """<?xml version="1.0"?>
 <sdf version="1.9">
   <world name="warehouse">
@@ -13,8 +20,8 @@ HEAD = """<?xml version="1.0"?>
     <plugin filename="gz-sim-sensors-system" name="gz::sim::systems::Sensors"><render_engine>ogre2</render_engine></plugin>
     <plugin filename="gz-sim-imu-system" name="gz::sim::systems::Imu"/>
     <scene>
-      <ambient>0.7 0.7 0.7 1</ambient>
-      <background>0.8 0.85 0.9 1</background>
+      <ambient>0.8 0.8 0.8 1</ambient>
+      <background>0.94 0.94 0.98 1</background>
       <shadows>false</shadows>
     </scene>
     <light type="directional" name="sun">
@@ -27,43 +34,44 @@ HEAD = """<?xml version="1.0"?>
 """
 TAIL = "  </world>\n</sdf>\n"
 
+FLOOR = (0.82, 0.82, 0.85)
+WALL = (0.18, 0.18, 0.2)
+GREEN = (0.08, 0.75, 0.2)
+BLUE = (0.08, 0.3, 0.9)
+
 
 def box(name, x, y, z, sx, sy, sz, rgb, collide=True):
-    size = f"{sx} {sy} {sz}"
+    size = f'{sx} {sy} {sz}'
     r, g, b = rgb
-    col = ""
+    collision = ''
     if collide:
-        col = (f"<collision name='c'><geometry><box><size>{size}</size>"
-               f"</box></geometry></collision>")
-    return (f"    <model name='{name}'><static>true</static>"
-            f"<pose>{x} {y} {z} 0 0 0</pose><link name='l'>{col}"
-            f"<visual name='v'><geometry><box><size>{size}</size></box></geometry>"
-            f"<material><ambient>{r} {g} {b} 1</ambient>"
-            f"<diffuse>{r} {g} {b} 1</diffuse></material></visual>"
-            f"</link></model>\n")
+        collision = (
+            f"<collision name='collision'><geometry><box><size>{size}</size>"
+            "</box></geometry></collision>"
+        )
+    return (
+        f"    <model name='{name}'><static>true</static>"
+        f"<pose>{x} {y} {z} 0 0 0</pose><link name='link'>{collision}"
+        f"<visual name='visual'><geometry><box><size>{size}</size></box></geometry>"
+        f"<material><ambient>{r} {g} {b} 1</ambient>"
+        f"<diffuse>{r} {g} {b} 1</diffuse></material></visual>"
+        "</link></model>\n"
+    )
 
 
-GRAY, WALL, BROWN = (0.75, 0.75, 0.75), (0.5, 0.5, 0.55), (0.6, 0.4, 0.2)
-GREEN, BLUE = (0.1, 0.7, 0.2), (0.1, 0.3, 0.9)
+world = HEAD
+world += box('floor', 0, 0, -0.05, 30, 30, 0.1, FLOOR)
+for name, x, y, sx, sy in WALLS:
+    world += box(name, x, y, 0.3, sx, sy, 0.6, WALL)
 
-out = HEAD
-out += box("floor", 0, 0, -0.05, 30, 30, 0.1, GRAY)
-out += box("wall_n", 0, 6.1, 1, 18.4, 0.2, 2, WALL)
-out += box("wall_s", 0, -6.1, 1, 18.4, 0.2, 2, WALL)
-out += box("wall_e", 9.1, 0, 1, 0.2, 12, 2, WALL)
-out += box("wall_w", -9.1, 0, 1, 0.2, 12, 2, WALL)
+for index, key in enumerate(('P1', 'P2'), 1):
+    x, y = LOCATIONS[key]
+    world += box(f'pickup_{index}', x, y, 0.01, 0.8, 0.8, 0.02, GREEN, False)
+for index, key in enumerate(('D1', 'D2'), 1):
+    x, y = LOCATIONS[key]
+    world += box(f'delivery_{index}', x, y, 0.01, 0.8, 0.8, 0.02, BLUE, False)
+world += TAIL
 
-for row, y in zip("abcd", (4.2, 1.2, -1.2, -4.2)):
-    out += box(f"shelf_{row}1", -4.5, y, 0.75, 6, 0.6, 1.5, BROWN)
-    out += box(f"shelf_{row}2", 4.5, y, 0.75, 6, 0.6, 1.5, BROWN)
-
-out += box("pickup_1", -8.2, 2.7, 0.01, 1, 1, 0.02, GREEN, False)
-out += box("pickup_2", -8.2, -2.7, 0.01, 1, 1, 0.02, GREEN, False)
-out += box("delivery_1", 8.2, 2.7, 0.01, 1, 1, 0.02, BLUE, False)
-out += box("delivery_2", 8.2, -2.7, 0.01, 1, 1, 0.02, BLUE, False)
-out += TAIL
-
-path = os.path.expanduser("~/ugp_ws/src/ugp_warehouse/worlds/warehouse.sdf")
-with open(path, "w") as f:
-    f.write(out)
-print("wrote", path)
+with open(WORLD_PATH, 'w', encoding='utf-8') as sdf_file:
+    sdf_file.write(world)
+print('wrote', WORLD_PATH)

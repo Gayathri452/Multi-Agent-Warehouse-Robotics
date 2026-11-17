@@ -1,6 +1,6 @@
 """AMCL localization for ONE robot (publishes map -> <robot>/odom).
 
-  ros2 launch ugp_warehouse amcl.launch.py robot:=robot_2 x:=-8.3 y:=-1.0 yaw:=-1.5708
+  ros2 launch ugp_warehouse amcl.launch.py robot:=robot_2 x:=-8.0 y:=-5.3 yaw:=0.0
 
 Defaults match robot_1. x, y, yaw are the robot's spawn pose = AMCL's initial pose.
 """

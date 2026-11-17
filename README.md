@@ -75,11 +75,11 @@ are not part of this phase.
 Send the robot to delivery zone D1 (east side):
 ```bash
 ros2 action send_goal /robot_1/navigate_to_pose nav2_msgs/action/NavigateToPose \
-  "{pose: {header: {frame_id: map}, pose: {position: {x: 8.2, y: 2.7}, orientation: {w: 1.0}}}}" --feedback
+  "{pose: {header: {frame_id: map}, pose: {position: {x: 7.0, y: 4.8}, orientation: {w: 1.0}}}}" --feedback
 ```
 Expect `Goal finished with status: SUCCEEDED` (about 1 to 1.5 minutes).
 
-Pickup zones: P1 (-8.2, 2.7), P2 (-8.2, -2.7). Delivery zones: D1 (8.2, 2.7), D2 (8.2, -2.7).
+Pickup zones: P1 (-7.0, -4.8), P2 (-7.0, 4.8). Delivery zones: D1 (7.0, 4.8), D2 (7.0, -4.8).
 
 Unreachable goal (inside a shelf) should end `ABORTED` with error code 208:
 ```bash
@@ -161,6 +161,31 @@ rviz2 -d ~/ugp_ws/src/ugp_warehouse/rviz/warehouse.rviz --ros-args -p use_sim_ti
 Use the **2D Goal Pose** button to click a goal on the map.
 In RViz, set the Map display's Durability Policy to **Transient Local** if the map does not show.
 
+To make Gazebo Harmonic open with a top-down camera view, run this once from the
+workspace source directory after Gazebo has been opened at least once:
+
+```bash
+python3 scripts/set_gazebo_top_view.py
+```
+
+Close and relaunch Gazebo. This updates only the saved camera pose in
+`~/.gz/sim/8/gui.config`; it does not change the world or Nav2 map.
+
+## Warehouse layout
+
+The Gazebo world uses dark, low partition walls on a light floor. The same wall
+geometry is shared by the generated Nav2 occupancy map, so robots plan around the
+visible obstacles. To regenerate either after editing `ugp_warehouse/layout.py`:
+
+```bash
+python3 make_world.py
+python3 make_map.py
+cd ~/ugp_ws
+colcon build --symlink-install
+```
+
+Restart the launch after rebuilding to load the updated world and map.
+
 ## Stop everything
 
 ```bash
@@ -186,6 +211,6 @@ Do this before restarting, or old nodes stay alive and cause strange errors.
 | `worlds/`, `models/` | Warehouse world and robot model |
 | `config/` | Occupancy map and Nav2 parameters |
 | `make_world.py`, `make_map.py`, `make_nav2_params.py` | Generators for the files above |
+| `ugp_warehouse/layout.py` | Shared wall geometry for the Gazebo world and Nav2 map |
 | `ugp_warehouse/cbs.py`, `fleet.py` | Phase 6: CBS planning, and pacing robots along the plan |
 | `ugp_warehouse/health.py`, `scripts/` | Phase 7: heartbeats, recovery, fault injection |
-
