@@ -169,7 +169,9 @@ python3 scripts/set_gazebo_top_view.py
 ```
 
 Close and relaunch Gazebo. This updates only the saved camera pose in
-`~/.gz/sim/8/gui.config`; it does not change the world or Nav2 map.
+`~/.gz/sim/8/gui.config`; it does not change the world or Nav2 map. The helper
+preserves Gazebo's plugin configuration and saves the original as
+`~/.gz/sim/8/gui.config.bak` before editing.
 
 ## Warehouse layout
 
