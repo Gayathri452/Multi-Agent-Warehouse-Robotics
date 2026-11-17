@@ -5,32 +5,51 @@ import argparse
 import os
 from pathlib import Path
 import re
+import shutil
 import tempfile
-import xml.etree.ElementTree as ET
 
 
 DEFAULT_CONFIG = Path.home() / '.gz' / 'sim' / '8' / 'gui.config'
 TOP_CAMERA_POSE = '0 0 22 0 1.57079632679 0'
+SCENE_PLUGIN = re.compile(
+    r'<plugin\b(?=[^>]*(?:\bname\s*=\s*["\']3D View["\']|'
+    r'\bfilename\s*=\s*["\'](?:GzScene3D|MinimalScene)["\']))'
+    r'[^>]*>.*?</plugin>',
+    re.DOTALL,
+)
 
 
-def load_config(path):
-    try:
-        return ET.parse(path)
-    except ET.ParseError:
-        text = path.read_text(encoding='utf-8')
-        text = re.sub(r'<\?xml\s+[^?]*\?>', '', text)
-        root = ET.fromstring(f'<gui>{text}</gui>')
-        nested_gui = root.find('gui')
-        if nested_gui is not None:
-            root.attrib.update(nested_gui.attrib)
-            children = list(root)
-            root.remove(nested_gui)
-            for index, child in enumerate(list(nested_gui)):
-                root.insert(index, child)
-            for child in children:
-                if child is not nested_gui:
-                    root.append(child)
-        return ET.ElementTree(root)
+def remove_legacy_wrapper(text):
+    match = re.fullmatch(
+        r'\s*(<\?xml[^?]*\?>\s*)?<gui(?:\s[^>]*)?>(.*)</gui>\s*',
+        text,
+        re.DOTALL,
+    )
+    if match is None:
+        return text
+    return (match.group(1) or '') + match.group(2).strip() + '\n'
+
+
+def set_camera_pose(text):
+    text = remove_legacy_wrapper(text)
+    scene = SCENE_PLUGIN.search(text)
+    if scene is None:
+        raise ValueError('No Gazebo 3D scene plugin was found in the GUI config')
+
+    plugin = scene.group(0)
+    camera_pose = re.compile(r'<camera_pose\b[^>]*>.*?</camera_pose>', re.DOTALL)
+    replacement = '<camera_pose>%s</camera_pose>' % TOP_CAMERA_POSE
+    if camera_pose.search(plugin):
+        plugin = camera_pose.sub(replacement, plugin, count=1)
+    else:
+        closing = re.search(r'(?m)^([ \t]*)</plugin>[ \t]*$', plugin)
+        if closing is None:
+            raise ValueError('Could not locate the end of the Gazebo 3D scene plugin')
+        indent = closing.group(1)
+        insertion = '%s  %s\n%s</plugin>' % (indent, replacement, indent)
+        plugin = plugin[:closing.start()] + insertion + plugin[closing.end():]
+
+    return text[:scene.start()] + plugin + text[scene.end():]
 
 
 def main():
@@ -44,30 +63,21 @@ def main():
             f'{config_path} not found. Start Gazebo once to create its default '
             'GUI config, then rerun this script.')
 
+    original = config_path.read_text(encoding='utf-8')
     try:
-        tree = load_config(config_path)
-    except ET.ParseError as error:
-        parser.error(f'Cannot parse Gazebo GUI config {config_path}: {error}')
-    scene = next(
-        (plugin for plugin in tree.getroot().iter('plugin')
-         if plugin.get('name') == '3D View'
-         or plugin.get('filename') in ('GzScene3D', 'MinimalScene')),
-        None,
-    )
-    if scene is None:
-        parser.error(f'No Gazebo 3D scene plugin found in {config_path}')
+        updated = set_camera_pose(original)
+    except ValueError as error:
+        parser.error(f'{error} in {config_path}')
 
-    camera_pose = scene.find('camera_pose')
-    if camera_pose is None:
-        camera_pose = ET.SubElement(scene, 'camera_pose')
-    camera_pose.text = TOP_CAMERA_POSE
-    ET.indent(tree, space='  ')
+    backup_path = config_path.with_name(config_path.name + '.bak')
+    if not backup_path.exists():
+        shutil.copy2(config_path, backup_path)
 
     fd, temp_name = tempfile.mkstemp(
         prefix=config_path.name + '.', dir=config_path.parent)
     try:
         with os.fdopen(fd, 'wb') as config_file:
-            tree.write(config_file, encoding='utf-8', xml_declaration=True)
+            config_file.write(updated.encode('utf-8'))
         os.replace(temp_name, config_path)
     except Exception:
         if os.path.exists(temp_name):
@@ -75,6 +85,7 @@ def main():
         raise
 
     print(f'Saved top-down camera pose to {config_path}')
+    print(f'Original GUI config backup: {backup_path}')
     print('Close and restart Gazebo for the new view to take effect.')
 
 
