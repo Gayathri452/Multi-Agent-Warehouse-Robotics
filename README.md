@@ -1,218 +1,237 @@
-# UGP: Resilient Multi-Robot Warehouse Logistics
+# Multi-Agent Warehouse Robotics
 
-ROS 2 Jazzy + Gazebo Harmonic + Nav2 simulation of differential-drive robots in a warehouse.
-Current state: two robots with Nav2 and AMCL, A* planning, task assignment,
-prioritized space-time coordination (Phase 5) and CBS coordination of every leg
-(Phase 6, used by the task manager), and failure detection and recovery (Phase 7).
+A ROS 2 Jazzy and Gazebo Harmonic simulation of three differential-drive robots
+performing coordinated warehouse pickup-and-delivery tasks. Nav2 handles motion;
+the project adds task assignment, joint multi-robot route planning, collision
+avoidance, and robot failure recovery.
+
+## What the project demonstrates
+
+- **Three simulated robots** (`robot_1`, `robot_2`, `robot_3`) navigating a shared
+  warehouse with AMCL localization and Nav2.
+- **Pickup-and-delivery task assignment** using A* route costs and robot workload.
+- **Coordinated route planning** using Conflict-Based Search (CBS). Robots are
+  paced by observed progress, wait for one another when necessary, and queue
+  rather than driving to the same pickup or delivery zone at once.
+- **Failure detection and recovery**. A robot that loses odometry or navigation
+  service is taken out of service; its task can be reassigned and the fleet
+  replans around it.
+
+The standard demo below runs **eight tasks** with all three robots. Tasks are
+assigned dynamically, so which robot performs each task can vary.
 
 ## Requirements
 
-- Ubuntu 24.04 (native, or WSL2 with GUI support)
-- ROS 2 Jazzy: https://docs.ros.org/en/jazzy/Installation/Ubuntu-Install-Debs.html
+- Ubuntu 24.04 (native or WSL2 with a working graphical desktop)
+- ROS 2 Jazzy
+- Gazebo Harmonic
+
+Install ROS 2 Jazzy first using the
+[official Ubuntu installation guide](https://docs.ros.org/en/jazzy/Installation/Ubuntu-Install-Debs.html).
+Then install the simulation and build dependencies:
 
 ```bash
 sudo apt update
-sudo apt install -y ros-jazzy-desktop ros-jazzy-ros-gz ros-jazzy-navigation2 \
-  ros-jazzy-nav2-bringup python3-colcon-common-extensions python3-numpy
+sudo apt install -y \
+  ros-jazzy-desktop \
+  ros-jazzy-ros-gz \
+  ros-jazzy-navigation2 \
+  ros-jazzy-nav2-bringup \
+  python3-colcon-common-extensions \
+  python3-numpy \
+  python3-rosdep
 ```
 
-## Get and build
+For screen recording, install OBS Studio too:
 
 ```bash
-mkdir -p ~/ugp_ws/src && cd ~/ugp_ws/src
-git clone https://github.com/Gayathri452/Multi-Agent-Warehouse-Robotics.git ugp_warehouse
-cd ~/ugp_ws
-source /opt/ros/jazzy/setup.bash
-colcon build --symlink-install
-source install/setup.bash
+sudo apt install -y obs-studio
 ```
 
-Every new terminal needs both of these first:
+## Get the source and build
+
+For a new checkout:
+
+```bash
+mkdir -p ~/ugp_ws/src
+cd ~/ugp_ws/src
+git clone -b main --single-branch \
+  https://github.com/Gayathri452/Multi-Agent-Warehouse-Robotics.git \
+  ugp_warehouse
+```
+
+If `~/ugp_ws/src/ugp_warehouse` already exists, update it instead of cloning
+again:
+
+```bash
+cd ~/ugp_ws/src/ugp_warehouse
+git switch main
+git pull origin main
+```
+
+Install any remaining ROS package dependencies and build:
+
+```bash
+sudo rosdep init  # Run once per Ubuntu installation; skip if already initialized.
+rosdep update
+cd ~/ugp_ws
+source /opt/ros/jazzy/setup.bash
+rosdep install --from-paths src --ignore-src -r -y
+colcon build --symlink-install
+```
+
+Every new terminal needs the ROS and workspace environments. Use this at the
+start of **each** terminal:
+
 ```bash
 source /opt/ros/jazzy/setup.bash
 source ~/ugp_ws/install/setup.bash
-```
-
-If other people share your network, pick your own number so you do not see their robots:
-```bash
 export ROS_DOMAIN_ID=42
 ```
 
-## Run
+The domain ID keeps this demo's ROS topics separate from other ROS systems on
+the same network. Use the same ID in every terminal.
 
-Start the complete two-robot system:
+## Run the three-robot, eight-task demo
+
+### 1. Start Gazebo and the robots
+
+In Terminal 1, source the environment as above, then run:
+
 ```bash
 ros2 launch ugp_warehouse bringup.launch.py
 ```
-Wait for Gazebo, both robots, AMCL, and Nav2 to start. In another sourced
-terminal, check that both navigators are active:
-```bash
-ros2 lifecycle get /robot_1/bt_navigator     # expect: active [3]
-ros2 lifecycle get /robot_2/bt_navigator     # expect: active [3]
-```
 
-Start a coordinated pickup-and-delivery run in another sourced terminal:
-```bash
-ros2 run ugp_warehouse task_manager --ros-args -p use_sim_time:=true \
-  -p "tasks:=['P1:D1','P2:D2']"
-```
+Keep this terminal open. Gazebo, the warehouse, and the three robots will start;
+AMCL and Nav2 launch in stages. On a first launch, allow about a minute for all
+three robots' navigation systems to become active.
 
-## Test
+### 2. (Optional) Set Gazebo to a top-down camera view
 
-Run the Phase 5 space-time coordinator tests (no ROS or simulator required):
-```bash
-python3 ugp_warehouse/test_space_time.py
-```
-The tests cover crossing routes with a scheduled wait, shared-goal exclusion,
-opposing routes in a narrow corridor, and swap-conflict detection. When the task
-manager assigns multiple tasks at once, it coordinates their pickup routes
-before sending them to Nav2. A route that cannot be scheduled is reported as
-failed rather than sent through a known conflict. (Phase 6 below replaces this:
-all legs are now coordinated.) Delivery legs still use the
-existing per-robot A* waypoint planner; dynamic replanning and failure recovery
-are not part of this phase.
-
-Send the robot to delivery zone D1 (east side):
-```bash
-ros2 action send_goal /robot_1/navigate_to_pose nav2_msgs/action/NavigateToPose \
-  "{pose: {header: {frame_id: map}, pose: {position: {x: 7.0, y: 4.8}, orientation: {w: 1.0}}}}" --feedback
-```
-Expect `Goal finished with status: SUCCEEDED` (about 1 to 1.5 minutes).
-
-Pickup zones: P1 (-7.0, -4.8), P2 (-7.0, 4.8). Delivery zones: D1 (7.0, 4.8), D2 (7.0, -4.8).
-
-Unreachable goal (inside a shelf) should end `ABORTED` with error code 208:
-```bash
-ros2 action send_goal /robot_1/navigate_to_pose nav2_msgs/action/NavigateToPose \
-  "{pose: {header: {frame_id: map}, pose: {position: {x: -4.5, y: 4.2}, orientation: {w: 1.0}}}}" --feedback
-```
-
-## Phase 6: conflict resolution
-
-The task manager now plans every leg of every robot (pickup and delivery) together
-with CBS and paces the robots by progress, not by a clock:
-
-* Whenever a leg starts or ends, all robots stop for about a second and are planned
-  together from where they are (`fleet.py`, using `cbs.py`).
-* Each robot then drives in segments: up to the last cell it may enter, then it
-  waits until the robots it has to let pass have moved on. Nav2 driving faster or
-  slower than planned cannot make robots meet.
-* Two robots never head for the same zone at once. The robot with the older task
-  goes first; the other queues just outside the zone. An idle robot standing in
-  someone's way is moved aside.
-* Robots keep 1.25 m between centres: 0.76 m robot width + 0.1 m margin + Nav2's
-  0.25 m `xy_goal_tolerance`. If you lower that tolerance in the Nav2 params, pass the
-  same value as `goal_tolerance` and the separation shrinks automatically.
-
-The deliberate conflict (two robots driving the same aisle in opposite directions):
-```bash
-ros2 launch ugp_warehouse bringup.launch.py        # terminal 1, wait for both Nav2s
-ros2 run ugp_warehouse task_manager --ros-args -p use_sim_time:=true \
-  -p "tasks:=['P2:D1','D1:P1']"                   # terminal 2
-```
-Look for `Plan by cbs`, `robot_X waits for robot_Y to pass` and `queuing near a busy
-zone` in the log. In RViz, add Path displays for `/robot_1/planned_path` and
-`/robot_2/planned_path` to see the plans.
-
-Tests (no ROS needed):
-```bash
-cd ~/ugp_ws/src/ugp_warehouse/ugp_warehouse
-python3 test_cbs.py      # about 3 s: prioritized planning vs CBS, the head-on conflict
-python3 test_fleet.py    # about 70 s: full task runs in a simulator with random speeds,
-                         # Nav2-style stopping errors and AMCL-style pose updates
-```
-
-## Phase 7: failure detection and recovery
-
-The task manager watches two heartbeats per robot: its odometry from Gazebo
-(`/<robot>/odom`) and its Nav2 action servers. If either stops for 3 s the robot is
-**OUT OF SERVICE**: its task goes back in the queue and another robot takes it (a
-load already picked up is picked up again), the broken robot stays where it stopped
-and the others plan around it, keeping their usual distance. When it is healthy
-again for 10 s it is **BACK IN SERVICE** and gets tasks again. A robot that cannot
-get past something (Nav2 gives up after it stopped moving, or no progress for 25 s)
-marks the area ahead as blocked for 2 minutes and everyone replans around it. A task
-is tried on up to 3 robots before it is FAILED. Logic: `ugp_warehouse/health.py`.
-
-Tests (no ROS needed):
-```bash
-cd ~/ugp_ws/src/ugp_warehouse/ugp_warehouse
-python3 test_health.py   # heartbeats, timeouts, revival, stuck, blocked areas, attempts
-```
-
-Fault injection in Gazebo (run from `~/ugp_ws/src/ugp_warehouse`, in a third terminal,
-while the task manager is running):
-```bash
-bash scripts/fail_robot.sh robot_2     # robot_2's navigation crashes, wheels stop
-bash scripts/revive_robot.sh robot_2   # restart its Nav2 (leave that terminal open)
-bash scripts/block_route.sh            # drop a box in the north aisle at (-4.5, 2.7)
-bash scripts/unblock_route.sh          # remove the box again
-```
-Look for `OUT OF SERVICE`, `back in the queue`, `BACK IN SERVICE`, `route blocked
-near` and a last line like `All tasks finished: 4 done, 0 failed (1 handed to another
-robot after a failure)`.
-
-## Visualise (optional)
+The camera helper requires Gazebo to have created its GUI configuration at
+least once. If this is the first launch, wait for Gazebo to open, press **Ctrl+C**
+in Terminal 1, and run the helper from a sourced terminal:
 
 ```bash
-rviz2 -d ~/ugp_ws/src/ugp_warehouse/rviz/warehouse.rviz --ros-args -p use_sim_time:=true \
-  -r /tf:=/robot_1/tf -r /tf_static:=/robot_1/tf_static -r /goal_pose:=/robot_1/goal_pose
-```
-Use the **2D Goal Pose** button to click a goal on the map.
-In RViz, set the Map display's Durability Policy to **Transient Local** if the map does not show.
-
-To make Gazebo Harmonic open with a top-down camera view, run this once from the
-workspace source directory after Gazebo has been opened at least once:
-
-```bash
+cd ~/ugp_ws/src/ugp_warehouse
 python3 scripts/set_gazebo_top_view.py
 ```
 
-Close and relaunch Gazebo. This updates only the saved camera pose in
-`~/.gz/sim/8/gui.config`; it does not change the world or Nav2 map. The helper
-preserves Gazebo's plugin configuration and saves the original as
-`~/.gz/sim/8/gui.config.bak` before editing.
+The helper saves a backup at `~/.gz/sim/8/gui.config.bak`. Restart the launch
+command from Step 1; the top-down view is applied when Gazebo opens. This changes
+only the camera view, not the world or robot behavior.
 
-## Warehouse layout
+### 3. Verify that navigation is ready
 
-The Gazebo world uses dark, low partition walls on a light floor. The same wall
-geometry is shared by the generated Nav2 occupancy map, so robots plan around the
-visible obstacles. To regenerate either after editing `ugp_warehouse/layout.py`:
+In Terminal 2, source the environment as above, then check the lifecycle state
+of each robot:
 
 ```bash
-python3 make_world.py
-python3 make_map.py
-cd ~/ugp_ws
-colcon build --symlink-install
+for robot in robot_1 robot_2 robot_3; do
+  for node in amcl planner_server controller_server bt_navigator; do
+    printf '%s/%s: ' "$robot" "$node"
+    ros2 lifecycle get "/$robot/$node"
+  done
+done
 ```
 
-Restart the launch after rebuilding to load the updated world and map.
+Each node should report `active [3]`. If any are still starting, wait a little
+longer and run the check again.
 
-## Stop everything
+### 4. Start all eight tasks
+
+In Terminal 3, source the environment as above, then run:
 
 ```bash
-pkill -f "ros2 launch"; pkill -f -- "--ros-args"; pkill -f ruby; pkill -f parameter_bridge
+ros2 run ugp_warehouse task_manager --ros-args \
+  -p use_sim_time:=true \
+  -p "tasks:=['P1:D1','P2:D2','P1:D2','P2:D1','D1:P1','D2:P2','D1:P2','D2:P1']"
 ```
-Do this before restarting, or old nodes stay alive and cause strange errors.
+
+Each entry is `pickup:delivery`. The task manager assigns work to available
+robots and logs assignments, CBS plans, waits, and task progress. Run duration
+depends on computer performance and simulation speed. A successful run ends
+with:
+
+```text
+All tasks finished: 8 done, 0 failed
+```
+
+To watch the live task-status message in another terminal, source the environment
+and run:
+
+```bash
+ros2 topic echo /task_status std_msgs/msg/String
+```
+
+## Tests
+
+The planner, assignment, fleet coordination, and recovery tests can be run
+without launching ROS or Gazebo. From the repository root:
+
+```bash
+python3 ugp_warehouse/test_astar.py
+python3 ugp_warehouse/test_tasks.py
+python3 ugp_warehouse/test_space_time.py
+python3 ugp_warehouse/test_cbs.py
+python3 ugp_warehouse/test_health.py
+python3 ugp_warehouse/test_fleet.py
+```
+
+`test_fleet.py` runs multiple simulated fleet scenarios and may take about a
+minute. Each test script prints its checks and reports failures.
+
+## Optional: demonstrate failure recovery
+
+While the task manager is running, use another sourced terminal from the
+repository root to stop a robot's navigation:
+
+```bash
+bash scripts/fail_robot.sh robot_2
+```
+
+The task manager should report the robot out of service and reassign its task
+when possible. Restore the robot with:
+
+```bash
+bash scripts/revive_robot.sh robot_2
+```
+
+The revive script must remain running in its terminal while Nav2 restarts.
+Other supported demonstrations are `scripts/block_route.sh` and
+`scripts/unblock_route.sh`.
+
+## Warehouse locations
+
+| Location | Map coordinates (m) | Use |
+|---|---:|---|
+| P1 | (-7.0, -4.8) | Pickup |
+| P2 | (-7.0, 4.8) | Pickup |
+| D1 | (7.0, 4.8) | Delivery |
+| D2 | (7.0, -4.8) | Delivery |
+
+## Project structure
+
+| Path | Responsibility |
+|---|---|
+| `launch/` | Starts Gazebo, map, AMCL, TF relay, and Nav2 |
+| `worlds/`, `models/` | Warehouse world and robot model |
+| `config/` | Map and per-robot Nav2 parameters |
+| `ugp_warehouse/task_manager.py` | ROS task execution, status, and recovery coordination |
+| `ugp_warehouse/tasks.py` | Task state and cost-based robot assignment |
+| `ugp_warehouse/astar.py` | Grid-based route planning |
+| `ugp_warehouse/cbs.py`, `fleet.py` | Joint conflict resolution and progress-based fleet pacing |
+| `ugp_warehouse/health.py` | Robot health monitoring and recovery |
+| `scripts/` | Camera setup and fault-injection helpers |
+| `make_world.py`, `make_map.py` | Regenerate world/map from the shared layout |
 
 ## Troubleshooting
 
-| Problem | Fix |
+| Symptom | What to check |
 |---|---|
-| `Package 'ugp_warehouse' not found` | You did not source `install/setup.bash` in this terminal |
-| Goal rejected: "Action server is inactive" | Nav2 did not finish starting. Stop everything and start again in order |
-| `Timed out waiting for transform ... map` | AMCL is not running yet. Start terminal 3 before terminal 4 |
-| Robot or Gazebo is very slow | Close other apps. Lidar rendering is CPU-heavy without a GPU |
-| Map missing in RViz | Map display: Durability Policy `Transient Local` |
-
-## Layout
-
-| Path | Purpose |
-|---|---|
-| `launch/` | `warehouse` (sim + robot), `map`, `amcl`, `nav2` |
-| `worlds/`, `models/` | Warehouse world and robot model |
-| `config/` | Occupancy map and Nav2 parameters |
-| `make_world.py`, `make_map.py`, `make_nav2_params.py` | Generators for the files above |
-| `ugp_warehouse/layout.py` | Shared wall geometry for the Gazebo world and Nav2 map |
-| `ugp_warehouse/cbs.py`, `fleet.py` | Phase 6: CBS planning, and pacing robots along the plan |
-| `ugp_warehouse/health.py`, `scripts/` | Phase 7: heartbeats, recovery, fault injection |
+| `Package 'ugp_warehouse' not found` | Source both `/opt/ros/jazzy/setup.bash` and `~/ugp_ws/install/setup.bash` in that terminal. |
+| A lifecycle node is not `active [3]` | Keep the launch terminal open and wait for startup; check again after a short delay. |
+| A robot is missing in Gazebo | Check the launch terminal for spawn errors and verify its odometry, e.g. `ros2 topic echo /robot_2/odom --once`. |
+| Gazebo is slow | Close other applications; lidar rendering is CPU/GPU intensive. |
+| Map is missing in RViz | Set the Map display's durability policy to **Transient Local**. |
+| Robots/topics are not visible across terminals | Confirm every terminal uses the same `ROS_DOMAIN_ID`. |
