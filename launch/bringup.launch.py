@@ -35,13 +35,13 @@ def generate_launch_description():
              output='screen',
              parameters=[{'use_sim_time': True, 'robots': [r[0] for r in ROBOTS]}]),
     ]
-    amcl = [include('amcl.launch.py', robot=n, x=x, y=y, yaw=yaw)
-            for n, x, y, yaw in ROBOTS]
+    amcl = [TimerAction(period=6.0 * i, actions=[include('amcl.launch.py', robot=n, x=x, y=y, yaw=yaw)])
+            for i, (n, x, y, yaw) in enumerate(ROBOTS)]
     nav2 = [TimerAction(period=6.0 * i, actions=[include('nav2.launch.py', robot=r[0])])
             for i, r in enumerate(ROBOTS)]
     return LaunchDescription([
         sim,
         TimerAction(period=12.0, actions=map_and_tf),
         TimerAction(period=24.0, actions=amcl),
-        TimerAction(period=38.0, actions=nav2),
+        TimerAction(period=42.0, actions=nav2),
     ])

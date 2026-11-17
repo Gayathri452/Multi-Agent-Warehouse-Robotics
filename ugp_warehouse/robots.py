@@ -6,4 +6,5 @@ Add a robot here and re-run make_nav2_params.py + ugp-build.
 ROBOTS = [
     ('robot_1', -8.0, 0.0, 0.0),
     ('robot_2', -8.3, -1.0, -1.5708),
+    ('robot_3', -8.3, 1.0, 1.5708),
 ]
